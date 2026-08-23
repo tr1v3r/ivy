@@ -1,3 +1,17 @@
+// Package ivy is a hierarchical content-construction engine.
+//
+// Content starts from a root template and flows down a tree addressed by
+// paths. Each node carries a directive — a chain of driver.Processor
+// transformations — applied on top of the content inherited from its
+// parent, so querying a path returns the template progressively shaped by
+// every level above it.
+//
+// Trees come in four evaluation modes (standard, lazy, instant, cache TTL)
+// and are managed by a Forest, which owns tree builders so trees can be
+// rebuilt on refresh. Processors implementing driver.ParamAware form a
+// per-request dynamic layer whose output is computed per query and never
+// cached, enabling param-differentiated queries without polluting the
+// static cache.
 package ivy
 
 import (

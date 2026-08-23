@@ -1,3 +1,11 @@
+// Package web exposes the ivy engine over HTTP.
+//
+// It wires a gin router with the rule-query API (GET /api/v1/rule passes
+// URL query params into the tree's RealizeContext so param-aware
+// processors can differentiate per request), a health-check ping, and
+// placeholder routes for future management endpoints. Serve runs the
+// HTTP server with graceful shutdown; InitForest/RefreshForest manage the
+// engine's forest lifecycle for the server process.
 package web
 
 import (
@@ -17,6 +25,8 @@ const treeName = "default"
 
 var f ivy.Forest
 
+// Serve starts the HTTP server on :8080 and blocks until a shutdown
+// signal arrives, then drains in-flight requests within timeout.
 func Serve(timeout time.Duration, handler http.Handler) {
 	srv := &http.Server{
 		Addr:    ":8080",
@@ -29,7 +39,7 @@ func Serve(timeout time.Duration, handler http.Handler) {
 		}
 	}()
 
-	// wati shutdown signal
+	// wait for shutdown signal
 	<-guard.Cancel()
 	log.Info("Shutdown Server ...")
 
@@ -49,10 +59,16 @@ func Serve(timeout time.Duration, handler http.Handler) {
 	log.Info("Server exiting")
 }
 
+// InitForest builds the process-wide forest from the given tree builders.
+// Call once during startup, before serving requests.
 func InitForest(builders ...ivy.TreeBuilder) { f = ivy.NewForest(builders...) }
 
+// RefreshForest rebuilds every tree in the forest by re-running its
+// builder, picking up directive changes since the last build.
 func RefreshForest() { f = f.Build() }
 
+// DefaultBuilder returns a TreeBuilder for the tree named "default":
+// a standard-mode JSON tree rooted at `{}` with the given directives.
 func DefaultBuilder(directives ...ivy.Directive) ivy.TreeBuilder {
 	return func() ivy.Tree {
 		tree, err := ivy.NewTree(&webDriver{PathParser: driver.SlashPathParser, Modem: driver.DummyModem},

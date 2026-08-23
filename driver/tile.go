@@ -4,6 +4,8 @@ import "encoding/json"
 
 var _ Driver = (*TileDriver)(nil)
 
+// NewTileDriver creates a driver for raw tile content: slash-separated
+// paths, plain realization and RawProcessor serialization.
 func NewTileDriver() *TileDriver {
 	return &TileDriver{
 		PathParser: SlashPathParser,
@@ -22,4 +24,5 @@ type TileDriver struct {
 	Modem
 }
 
+// Name returns "tile".
 func (TileDriver) Name() string { return "tile" }

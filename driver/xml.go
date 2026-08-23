@@ -54,21 +54,33 @@ type XMLProcessor struct {
 	C time.Time `json:"created_at"`
 }
 
-func (op *XMLProcessor) Type() string         { return op.T }
-func (op *XMLProcessor) Path() string         { return op.P }
-func (op *XMLProcessor) Author() string       { return op.A }
+// Type returns the operation type (create/set/replace/delete).
+func (op *XMLProcessor) Type() string { return op.T }
+
+// Path returns the target tree path of the Processor.
+func (op *XMLProcessor) Path() string { return op.P }
+
+// Author returns the processor author.
+func (op *XMLProcessor) Author() string { return op.A }
+
+// CreatedAt returns the processor creation time.
 func (op *XMLProcessor) CreatedAt() time.Time { return op.C }
+
+// Load populates the processor from its JSON serialization.
 func (op *XMLProcessor) Load(data []byte) error {
 	if err := json.Unmarshal(data, op); err != nil {
 		return fmt.Errorf("unmarshal fail: %w", err)
 	}
 	return nil
 }
+
+// Save returns the JSON serialization of the processor.
 func (op *XMLProcessor) Save() []byte {
 	data, _ := json.Marshal(op)
 	return data
 }
 
+// Process applies the typed operation to the XML document.
 func (op *XMLProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
 	if len(before) == 0 {
 		before = []byte(`<root/>`)

@@ -140,13 +140,11 @@ func NewLazyCacheTree[R Directive](driver driver.Driver, name, template string, 
 
 func newTree[R Directive](diver driver.Driver, name, template string) *tree {
 	return &tree{
-		name: name,
-
+		name:       name,
 		defaultCtx: &driver.RealizeContext{Context: context.Background()},
-
-		content:  []byte(template),
-		driver:   diver,
-		children: make(map[string]Tree),
+		content:    []byte(template),
+		driver:     diver,
+		children:   make(map[string]Tree),
 	}
 }
 func buildTree(tree *tree, directives ...Directive) (Tree, error) {
@@ -162,6 +160,7 @@ func toA[R Directive](directives ...R) (arr []Directive) {
 	return
 }
 
+// NewDirective builds a Directive applying the given processors at path.
 func NewDirective(path string, processors ...driver.Processor) Directive {
 	return &directive{path, processors}
 }

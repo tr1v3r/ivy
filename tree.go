@@ -30,7 +30,7 @@ type tree struct {
 	content   []byte
 
 	// procs processor array
-	// only set when tree build, only concurrent reads, so mutex is verbose
+	// only set when tree build, only concurrent reads, so no mutex needed
 	procs []driver.Processor
 	// dynamicFrom is the index of the first param-aware processor in procs.
 	// procs[:dynamicFrom] is the cacheable static prefix; procs[dynamicFrom:]
@@ -399,7 +399,7 @@ func (t *tree) realizeWithContext(rc *driver.RealizeContext, procs []driver.Proc
 	if rc == nil {
 		rc = t.defaultCtx
 	}
-	// Fast path: read lock 检查是否可以跳过 realization
+	// Fast path: read lock checks whether realization can be skipped.
 	t.realizeMu.RLock()
 	if !t.instantMode && !t.realizedAt.IsZero() && (t.cacheTTL == 0 || time.Since(t.realizedAt) < t.cacheTTL) {
 		t.realizeMu.RUnlock()
@@ -407,15 +407,17 @@ func (t *tree) realizeWithContext(rc *driver.RealizeContext, procs []driver.Proc
 	}
 	t.realizeMu.RUnlock()
 
-	// Slow path: write lock 执行实际 realization
+	// Slow path: write lock performs the actual realization.
 	t.realizeMu.Lock()
 	defer t.realizeMu.Unlock()
-	// Double-check: 拿到写锁后再次检查，防止多个 goroutine 同时通过 fast path
+	// Double-check after acquiring the write lock, so concurrent goroutines
+	// that passed the fast path do not realize twice.
 	if !t.instantMode && !t.realizedAt.IsZero() && (t.cacheTTL == 0 || time.Since(t.realizedAt) < t.cacheTTL) {
 		return nil
 	}
 
-	// 限流仅针对 lazy/instant/cache 模式，标准模式在 build 阶段 realize 不限流
+	// Rate limiting applies to lazy/instant/cache modes only; standard mode
+	// realizes during build and is never limited.
 	if (t.lazyMode || t.instantMode || t.cacheTTL > 0) && !t.allow() {
 		return ErrRateLimited
 	}

@@ -4,6 +4,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// RegisterAPI wires the /api/v1 rule-query and management routes onto the
+// given router group. Most management routes are Ping placeholders;
+// GET /rule is the implemented query endpoint.
 func RegisterAPI(r *gin.RouterGroup) {
 	// api root path ping pong
 	r.GET("ping", Ping)
