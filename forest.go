@@ -71,7 +71,7 @@ func (f *forest) Build() Forest {
 
 // Append append tree and builder to forest
 func (f *forest) Append(builders ...TreeBuilder) Forest {
-	for _, builder := range f.getBuilders() {
+	for _, builder := range builders {
 		f.Register(builder)
 		f.Set(builder())
 	}

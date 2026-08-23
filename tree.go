@@ -162,6 +162,10 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 		return nil, ErrNotExistsTree
 	}
 
+	if rc != nil {
+		rc.TreePath = t.path
+	}
+
 	if err := t.realizeWithContext(rc, t.procs); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
@@ -173,6 +177,9 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 	if child := t.pickChild(t.driver.GetNameByLevel(path, t.level+1)); child != nil {
 		if child, ok := child.(*tree); ok {
 			child.inherit(t)
+		}
+		if rc != nil {
+			rc.ParentContent = t.get()
 		}
 		return child.GetWithContext(rc, path)
 	}
