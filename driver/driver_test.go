@@ -3,7 +3,7 @@ package driver_test
 import (
 	"encoding/json"
 	"fmt"
-	"os"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -91,14 +91,10 @@ func TestJSONDriver(t *testing.T) {
 }
 
 func TestYAMLProcessor(t *testing.T) {
-	var rule []byte
+	var rule = []byte(`name: ivy
+kind: engine
+`)
 	var err error
-
-	rule, err = os.ReadFile("/tmp/rule.yml")
-	if err != nil {
-		t.Errorf("read file fail: %s", err)
-		return
-	}
 
 	var ops = []driver.Processor{
 		&driver.RawProcessor{Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
@@ -117,6 +113,9 @@ func TestYAMLProcessor(t *testing.T) {
 			t.Errorf("Process fail: %s", err)
 			return
 		}
+	}
+	if !strings.Contains(string(rule), "unit: test") {
+		t.Errorf("expected unit=test in result, got: %s", rule)
 	}
 	t.Logf("got result: %s", rule)
 }

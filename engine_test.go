@@ -3,6 +3,8 @@ package ivy
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -54,10 +56,10 @@ func TestForest_run(t *testing.T) {
 		TargetPath string
 		Expected   string
 	}{
-		{"tree_1", "a/b", `{"id":1,"author":{"first":"river"},"name":"root","info":{"path":"path:a/b"}}`},
-		{"tree_1", "a/b/c/d", `{"id":1,"author":{"first":"river"},"name":"root","info":{"path":"path:a/b/c/d"}}`},
-		{"tree_1", "a/b/x", `{"id":1,"author":{"first":"river"},"name":"root","info":{"path":"path:a/b"}}`},
-		{"tree_2", "x/y/z", `{"code":200,"msg":"pong"}`},
+		{"json_tree_1", "a/b", `{"id":1,"author":{"first":"river"},"name":"root","info":{"path":"path:a/b"}}`},
+		{"json_tree_1", "a/b/c/d", `{"id":1,"author":{"first":"river"},"name":"root","info":{"path":"path:a/b/c/d"}}`},
+		{"json_tree_1", "a/b/x", `{"id":1,"author":{"first":"river"},"name":"root","info":{"path":"path:a/b"}}`},
+		{"json_tree_2", "x/y/z", `{"code":200,"msg":"pong"}`},
 	}
 
 	f := InitForest(t)
@@ -78,7 +80,14 @@ func TestForest_run(t *testing.T) {
 }
 
 func InitForest(t *testing.T) Forest {
-	var builders []TreeBuilder = []TreeBuilder{
+	// local pong server so the curl directive works without network access
+	pong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":200,"msg":"pong"}`))
+	}))
+	t.Cleanup(pong.Close)
+
+	var builders = []TreeBuilder{
 		func() Tree {
 			var rules = []*directive{
 				{path: "/", processors: []driver.Processor{
@@ -118,7 +127,7 @@ func InitForest(t *testing.T) Forest {
 			var rules = []*directive{
 				{path: "/a/b/c/d", processors: nil},
 				{path: "/a/b/c", processors: nil},
-				{path: "/", processors: []driver.Processor{&driver.CURLProcessor{URL: "https://xxx/ping"}}},
+				{path: "/", processors: []driver.Processor{&driver.CURLProcessor{URL: pong.URL + "/ping"}}},
 				{path: "/x/y/z", processors: nil},
 				{path: "/a/b/m", processors: nil},
 			}
@@ -288,12 +297,12 @@ type contextCapturingProcessor struct {
 	capture func(*driver.RealizeContext)
 }
 
-func (p *contextCapturingProcessor) Type() string                                    { return "test" }
-func (p *contextCapturingProcessor) Path() string                                    { return "" }
-func (p *contextCapturingProcessor) Author() string                                  { return "" }
-func (p *contextCapturingProcessor) CreatedAt() time.Time                            { return time.Time{} }
-func (p *contextCapturingProcessor) Load([]byte) error                               { return nil }
-func (p *contextCapturingProcessor) Save() []byte                                    { return nil }
+func (p *contextCapturingProcessor) Type() string         { return "test" }
+func (p *contextCapturingProcessor) Path() string         { return "" }
+func (p *contextCapturingProcessor) Author() string       { return "" }
+func (p *contextCapturingProcessor) CreatedAt() time.Time { return time.Time{} }
+func (p *contextCapturingProcessor) Load([]byte) error    { return nil }
+func (p *contextCapturingProcessor) Save() []byte         { return nil }
 func (p *contextCapturingProcessor) Process(rc *driver.RealizeContext, before []byte) ([]byte, error) {
 	if p.capture != nil {
 		p.capture(rc)
