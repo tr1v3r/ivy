@@ -14,12 +14,12 @@ type RawProcessor struct {
 	Proc func(ctx *RealizeContext, before []byte) (after []byte, err error)
 }
 
-func (op *RawProcessor) Type() string           { return "" }
-func (op *RawProcessor) Path() string           { return "" }
-func (op *RawProcessor) Author() string         { return op.author }
-func (op *RawProcessor) CreatedAt() time.Time   { return op.createdAt }
-func (op *RawProcessor) Load(data []byte) error { return ErrSerializeNotSupport }
-func (op *RawProcessor) Save() []byte           { return nil }
+func (op *RawProcessor) Type() string         { return "" }
+func (op *RawProcessor) Path() string         { return "" }
+func (op *RawProcessor) Author() string       { return op.author }
+func (op *RawProcessor) CreatedAt() time.Time { return op.createdAt }
+func (op *RawProcessor) Load(_ []byte) error  { return ErrSerializeNotSupport }
+func (op *RawProcessor) Save() []byte         { return nil }
 func (op *RawProcessor) Process(ctx *RealizeContext, before []byte) (after []byte, err error) {
 	return op.Proc(ctx, before)
 }

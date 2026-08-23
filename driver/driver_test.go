@@ -99,7 +99,7 @@ kind: engine
 	var ops = []driver.Processor{
 		&driver.RawProcessor{Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
 			var result any
-			if err := yaml.Unmarshal([]byte(before), &result); err != nil {
+			if err := yaml.Unmarshal(before, &result); err != nil {
 				return nil, fmt.Errorf("unmarshal rule fail: %w", err)
 			}
 			result.(map[string]any)["unit"] = "test"

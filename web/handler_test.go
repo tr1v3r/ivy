@@ -19,7 +19,7 @@ func init() { gin.SetMode(gin.TestMode) }
 
 func newTestRouter() *gin.Engine {
 	r := gin.New()
-	RegisterApi(r.Group("api/v1"))
+	RegisterAPI(r.Group("api/v1"))
 	return r
 }
 

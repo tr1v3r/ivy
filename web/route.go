@@ -4,7 +4,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func RegisterApi(r *gin.RouterGroup) {
+func RegisterAPI(r *gin.RouterGroup) {
 	// api root path ping pong
 	r.GET("ping", Ping)
 
@@ -30,7 +30,7 @@ func RegisterApi(r *gin.RouterGroup) {
 			m.POST("node", Ping)
 			// replace template
 			m.POST("template", Ping)
-			// check Processs on node
+			// check Processors on node
 			m.POST("check", Ping)
 		}
 	}

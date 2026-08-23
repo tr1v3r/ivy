@@ -34,8 +34,9 @@ func Serve(timeout time.Duration, handler http.Handler) {
 	log.Info("Shutdown Server ...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	err := srv.Shutdown(ctx)
+	cancel() // run before any Fatal exit below
+	if err != nil {
 		log.Fatal("Server Shutdown:", err)
 	}
 	// catching ctx.Done(). timeout of 5 seconds.

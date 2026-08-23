@@ -35,7 +35,7 @@ type DummyProcessor struct{}
 
 func (op *DummyProcessor) Type() string { return "dummy" }
 func (op *DummyProcessor) Path() string { return "" }
-func (op *DummyProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
+func (op *DummyProcessor) Process(_ *RealizeContext, _ []byte) (after []byte, err error) {
 	return nil, nil
 }
 func (op *DummyProcessor) Author() string       { return "dummy" }

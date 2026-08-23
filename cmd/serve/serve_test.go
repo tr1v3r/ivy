@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,7 +96,7 @@ func TestRegister(t *testing.T) {
 	// the api group and swagger route must be wired
 	found := false
 	for _, route := range r.Routes() {
-		if route.Path == "/api/v1/rule" && route.Method == "GET" {
+		if route.Path == "/api/v1/rule" && route.Method == http.MethodGet {
 			found = true
 		}
 	}

@@ -101,7 +101,7 @@ func (op *CURLProcessor) Save() []byte {
 	data, _ := json.Marshal(op)
 	return data
 }
-func (op *CURLProcessor) Process(rc *RealizeContext, _ []byte) ([]byte, error) {
+func (op *CURLProcessor) Process(_ *RealizeContext, _ []byte) ([]byte, error) {
 	method := strings.ToUpper(strings.TrimSpace(op.Method))
 	if method == "" {
 		method = "GET"

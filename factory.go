@@ -162,6 +162,6 @@ func toA[R Directive](directives ...R) (arr []Directive) {
 	return
 }
 
-func NewDirective(path string, Processors ...driver.Processor) Directive {
-	return &directive{path, Processors}
+func NewDirective(path string, processors ...driver.Processor) Directive {
+	return &directive{path, processors}
 }
