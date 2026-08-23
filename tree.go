@@ -32,6 +32,10 @@ type tree struct {
 	// procs processor array
 	// only set when tree build, only concurrent reads, so mutex is verbose
 	procs []driver.Processor
+	// dynamicFrom is the index of the first param-aware processor in procs.
+	// procs[:dynamicFrom] is the cacheable static prefix; procs[dynamicFrom:]
+	// is the dynamic layer re-applied per GetWithContext call (never cached).
+	dynamicFrom int
 
 	// fallback is called when path resolution cannot find a matching child.
 	fallback driver.Processor
@@ -139,7 +143,9 @@ func (t *tree) Get(path string) ([]byte, error) {
 		return nil, ErrNotExistsTree
 	}
 
-	if err := t.realize(t.procs); err != nil {
+	// Only the static prefix of the chain is realized into the cache;
+	// the dynamic layer needs request params and is skipped here.
+	if err := t.realize(t.staticProcs()); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
@@ -157,6 +163,17 @@ func (t *tree) Get(path string) ([]byte, error) {
 }
 
 // GetWithContext retrieves rule data with runtime context for dynamic construction.
+//
+// The static prefix of each node's processor chain follows the exact same
+// realization and caching path as Get (standard/lazy/instant/TTL all keep
+// their semantics). At the TARGET node only, the dynamic layer — processors
+// from the first param-aware one onwards — is re-applied on top of the
+// cached static base with the request context, and the result is returned
+// to the caller WITHOUT being written back to the node. The cache therefore
+// stays param-independent: different params never pollute each other.
+//
+// Dynamic processors on INTERMEDIATE nodes of the queried path are not
+// applied; descent uses their static content (inherit/ParentContent).
 func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, error) {
 	if t == nil {
 		return nil, ErrNotExistsTree
@@ -166,12 +183,12 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 		rc.TreePath = t.path
 	}
 
-	if err := t.realizeWithContext(rc, t.procs); err != nil {
+	if err := t.realizeWithContext(rc, t.staticProcs()); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
 	if t.driver.GetLevel(path) == t.level {
-		return t.get(), nil
+		return t.dynamicRealize(rc)
 	}
 
 	if child := t.pickChild(t.driver.GetNameByLevel(path, t.level+1)); child != nil {
@@ -184,6 +201,28 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 		return child.GetWithContext(rc, path)
 	}
 	return t.doFallback(rc, t.get())
+}
+
+// staticProcs returns the cacheable prefix of the processor chain:
+// everything before the first param-aware processor.
+func (t *tree) staticProcs() []driver.Processor {
+	return t.procs[:t.dynamicFrom]
+}
+
+// dynamicRealize applies the request-dependent tail of the processor chain
+// on top of the cached static base. The result goes to the caller only —
+// it is never written into t.content, so the cache stays param-independent
+// and no lock is needed beyond reading the base.
+func (t *tree) dynamicRealize(rc *driver.RealizeContext) ([]byte, error) {
+	content := t.get()
+	if t.dynamicFrom >= len(t.procs) {
+		return content, nil // fully static chain: nothing to do per request
+	}
+	content, err := t.driver.Realize(rc, content, t.procs[t.dynamicFrom:]...)
+	if err != nil {
+		return nil, fmt.Errorf("realize dynamic rule on %s fail: %w", t.Path(), err)
+	}
+	return content, nil
 }
 
 // doFallback calls the fallback processor if set, otherwise returns content unchanged.
@@ -328,11 +367,28 @@ func (t *tree) newSubTree(name string) Tree {
 
 // updateDirective parse raw rule Processor to tree node.
 func (t *tree) apply(procs ...driver.Processor) error {
+	t.procs = procs
+	t.dynamicFrom = dynamicSplit(procs)
 	if t.lazyMode {
-		t.procs = procs
 		return nil
 	}
-	return t.realize(procs)
+	// standard mode: realize only the static prefix at build time;
+	// the dynamic layer is applied per query in GetWithContext.
+	return t.realize(t.staticProcs())
+}
+
+// dynamicSplit returns the index of the first param-aware processor.
+// Everything from that index on produces request-dependent output.
+func dynamicSplit(procs []driver.Processor) int {
+	for i, proc := range procs {
+		if proc == nil {
+			continue
+		}
+		if _, ok := proc.(driver.ParamAware); ok {
+			return i
+		}
+	}
+	return len(procs)
 }
 
 func (t *tree) realize(procs []driver.Processor) error {

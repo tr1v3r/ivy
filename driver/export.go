@@ -60,6 +60,23 @@ type Processor interface {
 	Save() []byte
 }
 
+// ParamAware is an OPTIONAL interface for processors whose output depends
+// on request parameters carried by RealizeContext.Params.
+//
+// The tree splits a processor chain at the first ParamAware processor:
+// everything before it forms the cacheable static base (realized and
+// cached exactly as before), while from it on the processors form a
+// dynamic layer that is re-applied on every GetWithContext call and whose
+// result is returned to the caller only — it never lands in the node
+// cache. This keeps lazy/instant/TTL semantics intact for the static
+// base while allowing per-query differentiation.
+type ParamAware interface {
+	// ParamKeys returns the parameter names this processor depends on.
+	// It may be empty when the keys cannot be determined statically;
+	// implementing the interface alone already marks the processor dynamic.
+	ParamKeys() []string
+}
+
 // RealizeContext carries runtime information for dynamic rule construction.
 type RealizeContext struct {
 	context.Context

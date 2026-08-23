@@ -106,6 +106,8 @@ func load() (directives []ivy.Directive) {
 				op = new(driver.XMLProcessor)
 			case "toml":
 				op = new(driver.TOMLProcessor)
+			case "template":
+				op = new(driver.TemplateProcessor)
 			}
 			if op != nil {
 				if err := op.Load(opData.Data); err != nil {

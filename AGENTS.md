@@ -93,8 +93,26 @@ Multiple driver implementations:
 - `XMLProcessor`: XML data manipulation
 - `TOMLProcessor`: TOML data manipulation
 - `CURLProcessor`: HTTP request processing
+- `TemplateProcessor`: `${param}` interpolation at query time (param-aware)
 - `RawProcessor`: Custom transformation function
 - `CombinedProcessor`: Combines multiple processors
+
+### Param-Aware Processors (Dynamic Layer)
+
+A processor implementing the optional `driver.ParamAware` interface declares
+that its output depends on request params (`RealizeContext.Params`). The tree
+splits each node's chain at the first param-aware processor:
+
+- **static prefix** (`procs[:dynamicFrom]`): realized and cached exactly as
+  before — standard/lazy/instant/TTL semantics unchanged
+- **dynamic layer** (`procs[dynamicFrom:]`): re-applied on every
+  `GetWithContext` at the target node only; the result is returned to the
+  caller and never written into the node cache, so different params can never
+  pollute each other
+
+`Get` (no context) returns the static base with placeholders intact. Dynamic
+processors on intermediate nodes of a queried path are not applied; descent
+uses their static content.
 
 ## File Structure
 
