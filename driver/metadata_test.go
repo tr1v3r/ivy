@@ -48,16 +48,17 @@ func TestJSONProcessorMetadata(t *testing.T) {
 }
 
 func TestYAMLProcessorMetadataAndProcess(t *testing.T) {
-	op := &driver.YAMLProcessor{T: "append", V: []byte("x")}
+	created := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	op := &driver.YAMLProcessor{P: "/y", T: "append", A: "river", C: created}
 
 	if op.Type() != "append" {
 		t.Errorf("unexpected type: %s", op.Type())
 	}
-	if op.Path() != "" || op.Author() != "" {
+	if op.Path() != "/y" || op.Author() != "river" {
 		t.Errorf("unexpected path/author: %q %q", op.Path(), op.Author())
 	}
-	if op.CreatedAt().IsZero() {
-		t.Error("expected non-zero CreatedAt")
+	if !op.CreatedAt().Equal(created) {
+		t.Errorf("unexpected created_at: %v", op.CreatedAt())
 	}
 
 	// roundtrip
@@ -65,19 +66,27 @@ func TestYAMLProcessorMetadataAndProcess(t *testing.T) {
 	if err := restored.Load(op.Save()); err != nil {
 		t.Fatalf("load fail: %s", err)
 	}
-	if restored.Type() != "append" {
+	if restored.Type() != "append" || restored.Path() != "/y" || restored.Author() != "river" {
 		t.Errorf("roundtrip mismatch: %+v", restored)
+	}
+	if !restored.CreatedAt().Equal(created) {
+		t.Errorf("roundtrip created_at mismatch: %v", restored.CreatedAt())
 	}
 	if err := restored.Load([]byte("not-json")); err == nil {
 		t.Error("expected load error on invalid json")
 	}
 
-	// append case appends the type marker; other types leave content unchanged
-	if out, err := (&driver.YAMLProcessor{T: "append"}).Process(nil, []byte("a")); err != nil || string(out) != "aappend" {
-		t.Errorf("append process: out=%q err=%v", out, err)
+	// invalid yaml content surfaces the unmarshal error
+	if _, err := (&driver.YAMLProcessor{T: "set", YAMLPath: "a"}).Process(nil, []byte("\tbad: [yaml")); err == nil {
+		t.Error("expected error on invalid yaml content")
 	}
-	if out, err := (&driver.YAMLProcessor{T: "unknown"}).Process(nil, []byte("a")); err != nil || string(out) != "a" {
-		t.Errorf("default process: out=%q err=%v", out, err)
+	// empty path errors regardless of type
+	if _, err := (&driver.YAMLProcessor{T: "set"}).Process(nil, []byte("a: 1")); err == nil {
+		t.Error("expected error on empty yaml path")
+	}
+	// unknown type errors
+	if _, err := (&driver.YAMLProcessor{T: "unknown", YAMLPath: "a"}).Process(nil, []byte("a: 1")); err == nil {
+		t.Error("expected error for unknown yaml processor type")
 	}
 }
 
