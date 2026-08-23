@@ -1,10 +1,73 @@
+# golangci-lint configuration (v2 schema)
+# Docs: https://golangci-lint.run/usage/configuration/
 version: "2"
 
+run:
+  timeout: 5m
+
 linters:
+  # Start from nothing and enable an explicit, curated set:
+  # every entry here is a gate in CI, so keep the list intentional.
   default: none
   enable:
-    - errcheck
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
+    # --- correctness ---
+    - copyloopvar    # accidental loop-variable copies (pre-Go1.22 habit)
+    - errcheck       # unchecked errors
+    - errorlint      # errors.Is/As misuse, %v/%s instead of %w on errors
+    - govet          # the go vet suite
+    - ineffassign    # dead assignments
+    - staticcheck    # staticcheck + gosimple + stylecheck (SA/S/ST/QF)
+    - unconvert      # unnecessary type conversions
+    - unused         # unused code
+    # --- style & convention ---
+    - gocritic       # stable opinionated checks (see settings below)
+    - misspell       # typos in comments and strings
+    - revive         # golint successor, curated rule set below
+    - usestdlibvars  # http.MethodGet / http.StatusOK over literals
+    - whitespace     # stray blank lines at block start/end
+
+  settings:
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: increment-decrement
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: var-declaration
+        - name: var-naming
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # Tests deliberately use short names and redundant constructs.
+      - path: _test\.go
+        linters:
+          - gocritic
+          - revive
+
+formatters:
+  # `golangci-lint fmt` applies these; `run` also reports their diffs,
+  # which keeps the separate gofmt CI step honest.
+  enable:
+    - gofmt
+    - goimports

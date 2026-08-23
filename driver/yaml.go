@@ -48,8 +48,7 @@ func (op *YAMLProcessor) Process(_ *RealizeContext, before []byte) (after []byte
 	// if err := yaml.Unmarshal([]byte(before), &result); err != nil {
 	// 	return "", fmt.Errorf("unmarshal yaml fail: %w", err)
 	// }
-	switch op.T {
-	case "append":
+	if op.T == "append" {
 		return append(before, op.T...), nil
 	}
 	return before, nil

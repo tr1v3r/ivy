@@ -57,7 +57,7 @@ func main() {
 func register(r *gin.Engine) *gin.Engine {
 	apiV1 := r.Group("api/v1")
 	{
-		web.RegisterApi(apiV1)
+		web.RegisterAPI(apiV1)
 	}
 
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
