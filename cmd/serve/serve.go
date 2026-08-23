@@ -67,6 +67,8 @@ func register(r *gin.Engine) *gin.Engine {
 
 var defaultFilename = "../../conf/rules.json"
 
+// RuleDataItem is one entry of the rules file: the tree path the
+// directive applies to and the serialized processors to run there.
 type RuleDataItem struct {
 	Path       string `json:"path"`
 	Processors []struct {

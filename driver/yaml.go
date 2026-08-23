@@ -11,6 +11,8 @@ import (
 
 var _ Driver = (*YAMLDriver)(nil)
 
+// NewYAMLDriver creates a driver for YAML content with slash-separated
+// paths and JSON-encoded processor serialization.
 func NewYAMLDriver() *YAMLDriver {
 	return &YAMLDriver{
 		PathParser: SlashPathParser,
@@ -29,6 +31,7 @@ type YAMLDriver struct {
 	Modem
 }
 
+// Name returns "yaml".
 func (YAMLDriver) Name() string { return "yaml" }
 
 var _ Processor = (*YAMLProcessor)(nil)
@@ -52,21 +55,33 @@ type YAMLProcessor struct {
 	C time.Time `json:"created_at"`
 }
 
-func (op *YAMLProcessor) Type() string         { return op.T }
-func (op *YAMLProcessor) Path() string         { return op.P }
-func (op *YAMLProcessor) Author() string       { return op.A }
+// Type returns the operation type (create/append/set/replace/delete).
+func (op *YAMLProcessor) Type() string { return op.T }
+
+// Path returns the target tree path of the Processor.
+func (op *YAMLProcessor) Path() string { return op.P }
+
+// Author returns the processor author.
+func (op *YAMLProcessor) Author() string { return op.A }
+
+// CreatedAt returns the processor creation time.
 func (op *YAMLProcessor) CreatedAt() time.Time { return op.C }
+
+// Load populates the processor from its JSON serialization.
 func (op *YAMLProcessor) Load(data []byte) error {
 	if err := json.Unmarshal(data, op); err != nil {
 		return fmt.Errorf("unmarshal fail: %w", err)
 	}
 	return nil
 }
+
+// Save returns the JSON serialization of the processor.
 func (op *YAMLProcessor) Save() []byte {
 	data, _ := json.Marshal(op)
 	return data
 }
 
+// Process applies the typed operation to the YAML document.
 func (op *YAMLProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
 	m := make(map[string]any)
 	if len(before) > 0 {

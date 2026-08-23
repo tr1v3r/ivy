@@ -54,21 +54,33 @@ type TOMLProcessor struct {
 	C time.Time `json:"created_at"`
 }
 
-func (op *TOMLProcessor) Type() string         { return op.T }
-func (op *TOMLProcessor) Path() string         { return op.P }
-func (op *TOMLProcessor) Author() string       { return op.A }
+// Type returns the operation type (create/append/set/replace/delete).
+func (op *TOMLProcessor) Type() string { return op.T }
+
+// Path returns the target tree path of the Processor.
+func (op *TOMLProcessor) Path() string { return op.P }
+
+// Author returns the processor author.
+func (op *TOMLProcessor) Author() string { return op.A }
+
+// CreatedAt returns the processor creation time.
 func (op *TOMLProcessor) CreatedAt() time.Time { return op.C }
+
+// Load populates the processor from its JSON serialization.
 func (op *TOMLProcessor) Load(data []byte) error {
 	if err := json.Unmarshal(data, op); err != nil {
 		return fmt.Errorf("unmarshal fail: %w", err)
 	}
 	return nil
 }
+
+// Save returns the JSON serialization of the processor.
 func (op *TOMLProcessor) Save() []byte {
 	data, _ := json.Marshal(op)
 	return data
 }
 
+// Process applies the typed operation to the TOML document.
 func (op *TOMLProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
 	m := make(map[string]any)
 	if len(before) > 0 {

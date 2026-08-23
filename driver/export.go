@@ -1,3 +1,15 @@
+// Package driver defines the pluggable format layer of the ivy engine.
+//
+// A Driver bundles three concerns: a PathParser (path semantics for tree
+// traversal), a Realizer (applying processor chains to content), and a
+// Modem (serializing processors so rules can live in config files).
+// Concrete drivers exist for JSON, YAML, XML, TOML and Tile content.
+//
+// Processors are the transformation units. Besides format-specific ones,
+// CURLProcessor fetches remote content, TemplateProcessor interpolates
+// request params, and processors implementing ParamAware join the
+// request-scoped dynamic layer (see the ivy package for the caching
+// contract).
 package driver
 
 import (
@@ -50,7 +62,7 @@ type Processor interface {
 	// Process do process rule
 	Process(rc *RealizeContext, before []byte) (after []byte, err error)
 
-	// informatin
+	// information
 	Author() string
 	CreatedAt() time.Time
 

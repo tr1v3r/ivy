@@ -15,6 +15,7 @@ type GeneralModem[T Processor] struct {
 	Unmarshaler func(data []byte, v any) error
 }
 
+// Marshal serializes processors into their saved forms.
 func (m *GeneralModem[T]) Marshal(ops ...Processor) ([]byte, error) {
 	var buf = make([]json.RawMessage, 0, len(ops))
 	for _, op := range ops {
@@ -22,6 +23,8 @@ func (m *GeneralModem[T]) Marshal(ops ...Processor) ([]byte, error) {
 	}
 	return m.Marshaler(buf)
 }
+
+// Unmarshal rebuilds processors of type T from serialized data.
 func (m *GeneralModem[T]) Unmarshal(data []byte) ([]Processor, error) {
 	var buf = make([]json.RawMessage, 0, 8)
 	if err := m.Unmarshaler(data, &buf); err != nil {

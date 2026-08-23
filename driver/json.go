@@ -53,20 +53,33 @@ type JSONProcessor struct {
 	C time.Time `json:"created_at"`
 }
 
-func (op *JSONProcessor) Type() string         { return op.T }
-func (op *JSONProcessor) Path() string         { return op.P }
-func (op *JSONProcessor) Author() string       { return op.A }
+// Type returns the operation type (create/append/set/replace/delete).
+func (op *JSONProcessor) Type() string { return op.T }
+
+// Path returns the target tree path of the Processor.
+func (op *JSONProcessor) Path() string { return op.P }
+
+// Author returns the processor author.
+func (op *JSONProcessor) Author() string { return op.A }
+
+// CreatedAt returns the processor creation time.
 func (op *JSONProcessor) CreatedAt() time.Time { return op.C }
+
+// Load populates the processor from its JSON serialization.
 func (op *JSONProcessor) Load(data []byte) error {
 	if err := json.Unmarshal(data, op); err != nil {
 		return fmt.Errorf("unmarshal fail: %w", err)
 	}
 	return nil
 }
+
+// Save returns the JSON serialization of the processor.
 func (op *JSONProcessor) Save() []byte {
 	data, _ := json.Marshal(op)
 	return data
 }
+
+// Process applies the typed operation to the JSON content via sjson.
 func (op *JSONProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
 	switch op.T {
 	case "create", "append", "replace":

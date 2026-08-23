@@ -17,6 +17,8 @@ import (
 
 var _ Processor = (*CURLProcessor)(nil)
 
+// Diagnostic-detail limits and the placeholder shown for redacted values
+// in CURLProcessError messages.
 const (
 	maxCURLHeaderDetailBytes = 4 * 1024
 	maxCURLBodyDetailBytes   = 4 * 1024
@@ -68,7 +70,7 @@ func (e *CURLProcessError) Error() string {
 // failures to errors.Is/errors.As.
 func (e *CURLProcessError) Unwrap() error { return e.Err }
 
-// CURLProcessor
+// CURLProcessor fetches remote content over HTTP and returns it as the node content.
 type CURLProcessor struct {
 	// P is the target path of the Processor
 	P string `json:"path,omitempty"`
@@ -87,20 +89,33 @@ type CURLProcessor struct {
 	C time.Time `json:"created_at"`
 }
 
-func (op *CURLProcessor) Type() string         { return "curl" }
-func (op *CURLProcessor) Path() string         { return op.P }
-func (op *CURLProcessor) Author() string       { return op.A }
+// Type returns "curl".
+func (op *CURLProcessor) Type() string { return "curl" }
+
+// Path returns the target tree path of the Processor.
+func (op *CURLProcessor) Path() string { return op.P }
+
+// Author returns the processor author.
+func (op *CURLProcessor) Author() string { return op.A }
+
+// CreatedAt returns the processor creation time.
 func (op *CURLProcessor) CreatedAt() time.Time { return op.C }
+
+// Load populates the processor from its JSON serialization.
 func (op *CURLProcessor) Load(data []byte) error {
 	if err := json.Unmarshal(data, op); err != nil {
 		return fmt.Errorf("unmarshal fail: %w", err)
 	}
 	return nil
 }
+
+// Save returns the JSON serialization of the processor.
 func (op *CURLProcessor) Save() []byte {
 	data, _ := json.Marshal(op)
 	return data
 }
+
+// Process performs the HTTP request; non-2xx responses yield a *CURLProcessError with full diagnostics.
 func (op *CURLProcessor) Process(_ *RealizeContext, _ []byte) ([]byte, error) {
 	method := strings.ToUpper(strings.TrimSpace(op.Method))
 	if method == "" {

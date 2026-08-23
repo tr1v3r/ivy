@@ -39,9 +39,16 @@ type TemplateProcessor struct {
 	C time.Time `json:"created_at"`
 }
 
-func (op *TemplateProcessor) Type() string         { return "template" }
-func (op *TemplateProcessor) Path() string         { return op.P }
-func (op *TemplateProcessor) Author() string       { return op.A }
+// Type returns "template".
+func (op *TemplateProcessor) Type() string { return "template" }
+
+// Path returns the target tree path of the Processor.
+func (op *TemplateProcessor) Path() string { return op.P }
+
+// Author returns the processor author.
+func (op *TemplateProcessor) Author() string { return op.A }
+
+// CreatedAt returns the processor creation time.
 func (op *TemplateProcessor) CreatedAt() time.Time { return op.C }
 
 // ParamKeys returns the placeholder keys declared by Pattern.
@@ -61,6 +68,7 @@ func templateKeys(s string) []string {
 	return keys
 }
 
+// Load populates the processor from its JSON serialization.
 func (op *TemplateProcessor) Load(data []byte) error {
 	if err := json.Unmarshal(data, op); err != nil {
 		return fmt.Errorf("unmarshal fail: %w", err)
@@ -68,11 +76,13 @@ func (op *TemplateProcessor) Load(data []byte) error {
 	return nil
 }
 
+// Save returns the JSON serialization of the processor.
 func (op *TemplateProcessor) Save() []byte {
 	data, _ := json.Marshal(op)
 	return data
 }
 
+// Process renders the pattern or interpolates content placeholders with request params.
 func (op *TemplateProcessor) Process(rc *RealizeContext, before []byte) (after []byte, err error) {
 	params := Params(rc)
 	if op.Pattern != "" {
