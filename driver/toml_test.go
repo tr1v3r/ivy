@@ -15,8 +15,7 @@ func TestTOMLDriver(t *testing.T) {
 		&driver.TOMLProcessor{T: "create", TOMLPath: "server.port", V: []byte("8080")},
 		&driver.TOMLProcessor{T: "set", TOMLPath: "server.port", V: []byte("9090")},
 		&driver.TOMLProcessor{T: "create", TOMLPath: "server.tags", V: []byte(`["a", "b"]`)},
-		&driver.TOMLProcessor{T: "append", TOMLPath: "server.tags", V: []byte(`"c"`),
-		},
+		&driver.TOMLProcessor{T: "append", TOMLPath: "server.tags", V: []byte(`"c"`)},
 		&driver.TOMLProcessor{T: "delete", TOMLPath: "server.host"},
 		&driver.TOMLProcessor{T: "replace", TOMLPath: "server.tags", V: []byte(`["x"]`)},
 	}...)

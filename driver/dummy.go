@@ -33,10 +33,12 @@ var _ Processor = (*DummyProcessor)(nil)
 
 type DummyProcessor struct{}
 
-func (op *DummyProcessor) Type() string                                    { return "dummy" }
-func (op *DummyProcessor) Path() string                                    { return "" }
-func (op *DummyProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) { return nil, nil }
-func (op *DummyProcessor) Author() string                                  { return "dummy" }
-func (op *DummyProcessor) CreatedAt() time.Time                            { return time.Now() }
-func (op *DummyProcessor) Load([]byte) error                               { return nil }
-func (op *DummyProcessor) Save() []byte                                    { return nil }
+func (op *DummyProcessor) Type() string { return "dummy" }
+func (op *DummyProcessor) Path() string { return "" }
+func (op *DummyProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
+	return nil, nil
+}
+func (op *DummyProcessor) Author() string       { return "dummy" }
+func (op *DummyProcessor) CreatedAt() time.Time { return time.Now() }
+func (op *DummyProcessor) Load([]byte) error    { return nil }
+func (op *DummyProcessor) Save() []byte         { return nil }
