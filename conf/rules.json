@@ -1,7 +1,7 @@
 [
 	{
 		"path": "/",
-		"operators": [
+		"Processors": [
 			{
 				"type": "curl",
 				"data": {
