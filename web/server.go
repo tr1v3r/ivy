@@ -10,7 +10,6 @@ package web
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -98,7 +97,15 @@ func DefaultBuilder(directives ...ivy.Directive) ivy.TreeBuilder {
 		tree, err := ivy.NewTree(&webDriver{PathParser: driver.SlashPathParser, Modem: driver.DummyModem},
 			treeName, `{}`, directives...)
 		if err != nil {
-			panic(fmt.Errorf("build new tree fail: %w", err))
+			// A failing build (e.g. an unreachable or 5xx curl processor)
+			// must not panic: NewForest stores builders without a recover
+			// wrapper, so the panic escapes forest.Build() — fatal at
+			// startup, and process-killing when it fires inside a
+			// background refresh goroutine. Log, return nil (which
+			// forest.Build skips), and keep serving the previously
+			// built tree.
+			log.Error("build default tree fail: %s", err)
+			return nil
 		}
 		return tree
 	}
