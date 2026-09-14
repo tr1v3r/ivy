@@ -386,12 +386,24 @@ func (t *tree) newSubTree(name string) Tree {
 func (t *tree) apply(procs ...driver.Processor) error {
 	t.procs = procs
 	t.dynamicFrom = dynamicSplit(procs)
+	t.invalidateCache()
 	if t.lazyMode {
 		return nil
 	}
 	// standard mode: realize only the static prefix at build time;
 	// the dynamic layer is applied per query in GetWithContext.
 	return t.realize(t.staticProcs())
+}
+
+// invalidateCache marks the cached realization as stale so the next
+// realize re-runs the chain. Set() may replace a node's processors after
+// the node has already been realized; without invalidation the fast path
+// in realizeWithContext keeps serving the old content forever when
+// cacheTTL == 0 (which caches indefinitely).
+func (t *tree) invalidateCache() {
+	t.realizeMu.Lock()
+	defer t.realizeMu.Unlock()
+	t.realizedAt = time.Time{}
 }
 
 // dynamicSplit returns the index of the first param-aware processor.
