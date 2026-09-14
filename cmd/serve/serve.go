@@ -41,13 +41,13 @@ var timeout, _ = time.ParseDuration(os.Getenv("SHUTDOWN_TIMEOUT"))
 func main() {
 	web.InitForest(web.DefaultBuilder(load()...))
 
-	go func() {
-		for range time.Tick(5 * time.Second) {
-			log.Info("refreshing forest...")
-			web.RefreshForest()
-		}
-	}()
-
+	// No periodic refresh: rules are loaded once at startup and the
+	// directives never change afterwards, so a timed full Build only
+	// re-ran every processor on every node — with the shipped default
+	// config (a curl processor at "/") that meant one upstream HTTP call
+	// every 5s with zero traffic, replaying side effects and discarding
+	// caches. Rebuild on demand with web.RefreshForest() once a reload
+	// trigger exists (e.g. the management API or SIGHUP).
 	if timeout == 0 {
 		timeout = 3 * time.Second
 	}
