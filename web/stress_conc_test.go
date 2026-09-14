@@ -240,7 +240,6 @@ func TestStressInitForestSwapWhileReads(t *testing.T) {
 	r := newTestRouter()
 
 	allowed := map[string]bool{"v1": true, "v2": true, "v3": true}
-	var seen sync.Map // generation -> observed at least once
 
 	var readers sync.WaitGroup
 	stop := make(chan struct{})
@@ -285,7 +284,6 @@ func TestStressInitForestSwapWhileReads(t *testing.T) {
 					t.Errorf("%s: torn forest swap observed gen=%q (rule=%s)", probe, gen, rule)
 					return
 				}
-				seen.Store(gen, true)
 			}
 		}(w)
 	}

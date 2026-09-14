@@ -33,8 +33,10 @@ import (
 
 // writeRulesAtomic installs a one-directive rules file that creates
 // {"gen":"<gen>"} at the tree root, replacing any previous file atomically.
-func writeRulesAtomic(t *testing.T, file, gen string) {
-	t.Helper()
+// It returns an error instead of failing the test so the reload goroutine
+// can propagate failures through a channel (t.Fatalf must only run on the
+// test goroutine).
+func writeRulesAtomic(file, gen string) error {
 	items := []RuleDataItem{{
 		Path: "/",
 		Processors: []struct {
@@ -48,15 +50,16 @@ func writeRulesAtomic(t *testing.T, file, gen string) {
 	}}
 	data, err := json.Marshal(items)
 	if err != nil {
-		t.Fatalf("marshal rules fail: %s", err)
+		return fmt.Errorf("marshal rules fail: %w", err)
 	}
 	tmp := file + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		t.Fatalf("write rules fail: %s", err)
+		return fmt.Errorf("write rules fail: %w", err)
 	}
 	if err := os.Rename(tmp, file); err != nil {
-		t.Fatalf("rename rules fail: %s", err)
+		return fmt.Errorf("rename rules fail: %w", err)
 	}
+	return nil
 }
 
 // readGen issues one GET /api/v1/rule and returns the served generation.
@@ -96,7 +99,9 @@ func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			file := filepath.Join(dir, "rules.json")
-			writeRulesAtomic(t, file, "v1")
+			if err := writeRulesAtomic(file, "v1"); err != nil {
+				t.Fatalf("install rules fail: %s", err)
+			}
 			t.Setenv("RULES_FILE", file)
 
 			origTTL := ruleTTL
@@ -116,7 +121,10 @@ func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 			var readers sync.WaitGroup
 			stop := make(chan struct{})
 
-			// the SIGHUP handler body, in a loop, alternating generations
+			// the SIGHUP handler body, in a loop, alternating generations;
+			// write failures are reported through a channel so t.Fatalf
+			// stays on the test goroutine
+			reloadErrs := make(chan error, 1)
 			var reloader sync.WaitGroup
 			reloader.Add(1)
 			go func() {
@@ -133,7 +141,13 @@ func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 					} else {
 						gen = "v1"
 					}
-					writeRulesAtomic(t, file, gen)
+					if err := writeRulesAtomic(file, gen); err != nil {
+						select {
+						case reloadErrs <- err:
+						default:
+						}
+						return
+					}
 					web.InitForest(rulesBuilder(load()))
 					time.Sleep(2 * time.Millisecond) // pacing only, not an assertion
 				}
@@ -172,9 +186,16 @@ func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 			readers.Wait()
 			close(stop)
 			reloader.Wait()
+			select {
+			case err := <-reloadErrs:
+				t.Fatalf("reload goroutine failed to write rules: %s", err)
+			default:
+			}
 
 			// a final reload is observable end-to-end: file -> load -> builder -> forest -> request
-			writeRulesAtomic(t, file, "v2")
+			if err := writeRulesAtomic(file, "v2"); err != nil {
+				t.Fatalf("final rules write fail: %s", err)
+			}
 			web.InitForest(rulesBuilder(load()))
 			if gen, ok := readGen(t, r); !ok || gen != "v2" {
 				t.Fatalf("post-reload read must serve v2, got %q", gen)
