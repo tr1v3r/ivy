@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -38,16 +40,38 @@ import (
 
 var timeout, _ = time.ParseDuration(os.Getenv("SHUTDOWN_TIMEOUT"))
 
-func main() {
-	web.InitForest(web.DefaultBuilder(load()...))
+// ruleTTL caches rule-tree content for this duration when positive: e.g.
+// RULES_TTL=5m re-runs the directives' processors (curl rule URLs fetch
+// fresh upstream content) on the first access after each window. Zero or
+// invalid (the default) keeps the standard build-once behavior.
+var ruleTTL, _ = time.ParseDuration(os.Getenv("RULES_TTL"))
 
-	// No periodic refresh: rules are loaded once at startup and the
-	// directives never change afterwards, so a timed full Build only
-	// re-ran every processor on every node — with the shipped default
-	// config (a curl processor at "/") that meant one upstream HTTP call
-	// every 5s with zero traffic, replaying side effects and discarding
-	// caches. Rebuild on demand with web.RefreshForest() once a reload
-	// trigger exists (e.g. the management API or SIGHUP).
+// rulesBuilder picks the tree mode for the loaded rules: cache-TTL when
+// RULES_TTL is positive, standard build-once otherwise.
+func rulesBuilder(rules []ivy.Directive) ivy.TreeBuilder {
+	if ruleTTL > 0 {
+		return web.DefaultCacheBuilder(ruleTTL, rules...)
+	}
+	return web.DefaultBuilder(rules...)
+}
+
+func main() {
+	web.InitForest(rulesBuilder(load()))
+
+	// SIGHUP reloads RULES_FILE and swaps the forest in place (the swap
+	// itself is race-free: InitForest holds forestMu). This is the reload
+	// trigger replacing the removed 5s full-rebuild ticker (audit W3):
+	// content freshness belongs to RULES_TTL caching, config changes to
+	// an explicit signal.
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGHUP)
+		for range ch {
+			log.Info("SIGHUP received: reloading rules")
+			web.InitForest(rulesBuilder(load()))
+		}
+	}()
+
 	if timeout == 0 {
 		timeout = 3 * time.Second
 	}

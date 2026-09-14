@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tr1v3r/ivy"
 	"github.com/tr1v3r/ivy/driver"
@@ -116,5 +117,57 @@ func TestDefaultBuilderSurvivesUpstreamFailure(t *testing.T) {
 	}
 	if n := hits.Load(); n != 2 {
 		t.Errorf("failed refresh should have attempted the upstream exactly once more, got %d hits", n)
+	}
+}
+
+// TestDefaultCacheBuilder_TTLRefresh pins the RULES_TTL contract (audit
+// follow-up to W3): a cache-TTL rule tree realizes lazily on first access,
+// serves from cache within the TTL window, and re-runs its processors (curl
+// re-fetches the rule URL) on the first access after expiry. No timer, no
+// replay without traffic — and the re-realized root must be fresh content,
+// not compounded on the previous output (guards the F1 fix under TTL).
+func TestDefaultCacheBuilder_TTLRefresh(t *testing.T) {
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"up":true}`))
+	}))
+	defer upstream.Close()
+
+	const ttl = 50 * time.Millisecond
+	InitForest(DefaultCacheBuilder(ttl, ivy.NewDirective("/", &driver.CURLProcessor{URL: upstream.URL})))
+
+	// lazy: nothing realized before the first access
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("lazy tree must not realize before first access, got %d upstream hits", n)
+	}
+
+	r := newTestRouter()
+	get := func() {
+		t.Helper()
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/rule?name=default&path=/", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("expect 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		if body := w.Body.String(); strings.Contains(body, `{"up":true}{"up":true}`) {
+			t.Fatalf("compounded output detected, got %s", body)
+		}
+	}
+
+	get()
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("first access should realize once, got %d upstream hits", n)
+	}
+
+	get()
+	if n := hits.Load(); n != 1 {
+		t.Errorf("within TTL must serve from cache, got %d upstream hits", n)
+	}
+
+	time.Sleep(ttl + 30*time.Millisecond)
+	get()
+	if n := hits.Load(); n != 2 {
+		t.Errorf("after TTL the next access must re-realize, got %d upstream hits", n)
 	}
 }
