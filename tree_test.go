@@ -267,3 +267,75 @@ func TestTree_CacheTTLLeafRecomposesFromParent(t *testing.T) {
 		t.Fatalf("after TTL expiry: expect %q, got %q (leaf compounded)", "R-b", second)
 	}
 }
+
+// TestTree_SetReRealizes guards audit F2: Set is documented as "adds or
+// updates" (export.go). Updating the processors of an already-realized
+// standard-mode node must re-realize; the cached result must not pin the
+// old content forever.
+func TestTree_SetReRealizes(t *testing.T) {
+	tree, err := NewTree(newTestDriver(), "set_update", `{}`,
+		NewDirective("/", replaceProc("OLD")),
+	)
+	if err != nil {
+		t.Fatalf("build fail: %s", err)
+	}
+	if val, err := tree.Get("/"); err != nil || string(val) != "OLD" {
+		t.Fatalf("first get: val=%q err=%v", val, err)
+	}
+
+	if err := tree.Set(NewDirective("/", replaceProc("NEW"))); err != nil {
+		t.Fatalf("set fail: %s", err)
+	}
+	val, err := tree.Get("/")
+	if err != nil {
+		t.Fatalf("get after set fail: %s", err)
+	}
+	if string(val) != "NEW" {
+		t.Fatalf("Set update not effective: expect %q, got %q (stale cache)", "NEW", val)
+	}
+}
+
+// TestTree_SetReRealizesLazy is the lazy-mode variant: with cacheTTL == 0 a
+// realized lazy node caches forever, so a Set() replacement must also
+// invalidate that cache.
+func TestTree_SetReRealizesLazy(t *testing.T) {
+	tree, err := NewLazyTree(newTestDriver(), "set_update_lazy", `{}`,
+		NewDirective("/a/b", replaceProc("OLD")),
+	)
+	if err != nil {
+		t.Fatalf("build fail: %s", err)
+	}
+	if val, err := tree.Get("/a/b"); err != nil || string(val) != "OLD" {
+		t.Fatalf("first get: val=%q err=%v", val, err)
+	}
+
+	if err := tree.Set(NewDirective("/a/b", replaceProc("NEW"))); err != nil {
+		t.Fatalf("set fail: %s", err)
+	}
+	val, err := tree.Get("/a/b")
+	if err != nil {
+		t.Fatalf("get after set fail: %s", err)
+	}
+	if string(val) != "NEW" {
+		t.Fatalf("Set update not effective (lazy): expect %q, got %q (stale cache)", "NEW", val)
+	}
+}
+
+// TestTree_DuplicateDirectivesLastWins guards the build-time face of the
+// same bug: two directives on the same path, the last one must win.
+func TestTree_DuplicateDirectivesLastWins(t *testing.T) {
+	tree, err := NewTree(newTestDriver(), "dup_directives", `{}`,
+		NewDirective("/", replaceProc("first")),
+		NewDirective("/", replaceProc("second")),
+	)
+	if err != nil {
+		t.Fatalf("build fail: %s", err)
+	}
+	val, err := tree.Get("/")
+	if err != nil {
+		t.Fatalf("get fail: %s", err)
+	}
+	if string(val) != "second" {
+		t.Fatalf("duplicate directives: expect last one %q to win, got %q", "second", val)
+	}
+}
