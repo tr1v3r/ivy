@@ -6,7 +6,7 @@ require (
 	github.com/gin-gonic/gin v1.9.1
 	github.com/pelletier/go-toml/v2 v2.0.8
 	github.com/swaggo/files v1.0.1
-	github.com/swaggo/gin-swagger v1.6.0
+	github.com/swaggo/gin-swagger v1.6.1
 	github.com/swaggo/swag v1.16.2
 	github.com/tidwall/sjson v1.2.5
 	github.com/tr1v3r/pkg v0.1.8
