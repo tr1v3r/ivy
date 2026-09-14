@@ -149,10 +149,18 @@ func (t *tree) Get(path string) ([]byte, error) {
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
+	return t.getWithParent(nil, path)
+}
 
+// getWithParent descends towards path carrying the parent's realized
+// content. The child's inheritance decision happens atomically inside its
+// realization (see realizeWithParentCtx), not as a separate write before
+// it — that separation is what allowed the lazy+TTL race where a late
+// inheritance write clobbered a concurrently refreshed result.
+func (t *tree) getWithParent(parentContent []byte, path string) ([]byte, error) {
 	// Only the static prefix of the chain is realized into the cache;
 	// the dynamic layer needs request params and is skipped here.
-	if err := t.realize(t.staticProcs()); err != nil {
+	if err := t.realizeWithParent(parentContent, t.staticProcs()); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
@@ -161,8 +169,8 @@ func (t *tree) Get(path string) ([]byte, error) {
 	}
 
 	if child := t.pickChild(t.driver.GetNameByLevel(path, t.level+1)); child != nil {
-		if child, ok := child.(*tree); ok {
-			child.inherit(t)
+		if ct, ok := child.(*tree); ok {
+			return ct.getWithParent(t.get(), path)
 		}
 		return child.Get(path)
 	}
@@ -185,12 +193,17 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
+	return t.getContextWithParent(rc, nil, path)
+}
 
+// getContextWithParent is the GetWithContext descent carrying the parent's
+// realized content for atomic inheritance (see getWithParent).
+func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []byte, path string) ([]byte, error) {
 	if rc != nil {
 		rc.TreePath = t.path
 	}
 
-	if err := t.realizeWithContext(rc, t.staticProcs()); err != nil {
+	if err := t.realizeWithParentCtx(rc, parentContent, t.staticProcs()); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
@@ -199,11 +212,11 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 	}
 
 	if child := t.pickChild(t.driver.GetNameByLevel(path, t.level+1)); child != nil {
-		if child, ok := child.(*tree); ok {
-			child.inherit(t)
-		}
 		if rc != nil {
 			rc.ParentContent = t.get()
+		}
+		if ct, ok := child.(*tree); ok {
+			return ct.getContextWithParent(rc, t.get(), path)
 		}
 		return child.GetWithContext(rc, path)
 	}
@@ -262,15 +275,6 @@ func (t *tree) SetDefaultContext(rc *driver.RealizeContext) {
 		if ct, ok := child.(*tree); ok {
 			ct.SetDefaultContext(rc)
 		}
-	}
-}
-
-// inherit set base by parent's content after check mode and realization.
-// The child's own content is produced by its realize call, starting from
-// the inherited base.
-func (t *tree) inherit(parent *tree) {
-	if t.lazyMode && t.needRealize() {
-		t.setBase(parent.get())
 	}
 }
 
@@ -405,10 +409,21 @@ func dynamicSplit(procs []driver.Processor) int {
 }
 
 func (t *tree) realize(procs []driver.Processor) error {
-	return t.realizeWithContext(t.defaultCtx, procs)
+	return t.realizeWithParentCtx(t.defaultCtx, nil, procs)
 }
 
-func (t *tree) realizeWithContext(rc *driver.RealizeContext, procs []driver.Processor) error {
+func (t *tree) realizeWithParent(parentContent []byte, procs []driver.Processor) error {
+	return t.realizeWithParentCtx(t.defaultCtx, parentContent, procs)
+}
+
+// realizeWithParentCtx realizes the node's chain, deciding the lazy-mode
+// inheritance from parentContent INSIDE the write-locked critical section,
+// atomically with the realization decision itself. With the check and the
+// write separated (the old inherit), a TTL could expire between them, or a
+// concurrent re-realization could complete in between: the node then either
+// composed from its own previous output (compounding) or had its fresh
+// result clobbered with raw parent content while realizedAt stayed fresh.
+func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []byte, procs []driver.Processor) error {
 	if rc == nil {
 		rc = t.defaultCtx
 	}
@@ -437,7 +452,15 @@ func (t *tree) realizeWithContext(rc *driver.RealizeContext, procs []driver.Proc
 
 	// Realize from the pre-processor base, never from the node's previous
 	// output: re-realization must be idempotent for non-idempotent chains.
-	rule, err := t.driver.Realize(rc, t.getBase(), procs...)
+	// Lazy nodes compose from the parent's realized content carried down
+	// by getWithParent; the decision is made here, under the write lock,
+	// together with the realization it feeds.
+	base := t.getBase()
+	if t.lazyMode && parentContent != nil {
+		base = parentContent
+	}
+
+	rule, err := t.driver.Realize(rc, base, procs...)
 	if err != nil {
 		return fmt.Errorf("realize rule fail: %w", err)
 	}
@@ -460,30 +483,11 @@ func (t *tree) get() (rule []byte) {
 	return t.content
 }
 
-// setBase sets the pre-processor base content.
-func (t *tree) setBase(base []byte) {
-	t.contentMu.Lock()
-	defer t.contentMu.Unlock()
-	t.base = base
-}
-
 // getBase return the pre-processor base content.
 func (t *tree) getBase() (base []byte) {
 	t.contentMu.RLock()
 	defer t.contentMu.RUnlock()
 	return t.base
-}
-
-func (t *tree) needRealize() bool {
-	t.realizeMu.RLock()
-	defer t.realizeMu.RUnlock()
-	if t.instantMode {
-		return true
-	}
-	if t.realizedAt.IsZero() {
-		return true
-	}
-	return t.cacheTTL > 0 && time.Since(t.realizedAt) >= t.cacheTTL
 }
 
 // byLevel sort rules by path level
