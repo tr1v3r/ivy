@@ -139,14 +139,16 @@ func NewLazyCacheTree[R Directive](driver driver.Driver, name, template string, 
 }
 
 func newTree[R Directive](diver driver.Driver, name, template string) *tree {
-	return &tree{
-		name:       name,
-		defaultCtx: &driver.RealizeContext{Context: context.Background()},
-		content:    []byte(template),
-		base:       []byte(template),
-		driver:     diver,
-		children:   make(map[string]Tree),
+	t := &tree{
+		name:     name,
+		content:  []byte(template),
+		base:     []byte(template),
+		driver:   diver,
+		children: make(map[string]Tree),
 	}
+	// atomics cannot be set in a composite literal (issue #47 fields)
+	t.defaultCtx.Store(&driver.RealizeContext{Context: context.Background()})
+	return t
 }
 func buildTree(tree *tree, directives ...Directive) (Tree, error) {
 	if err := tree.build(directives...); err != nil {

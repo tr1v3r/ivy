@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -36,16 +37,19 @@ type tree struct {
 	// non-idempotent processors.
 	base []byte
 
-	// procs processor array
-	// only set when tree build, only concurrent reads, so no mutex needed
-	procs []driver.Processor
-	// dynamicFrom is the index of the first param-aware processor in procs.
-	// procs[:dynamicFrom] is the cacheable static prefix; procs[dynamicFrom:]
-	// is the dynamic layer re-applied per GetWithContext call (never cached).
+	// procs/dynamicFrom form the node's processor chain. They are mutated
+	// by Set/apply at runtime, so both the writes (apply) and every read
+	// (realizeWithParentCtx's slow path, dynamicRealize) happen under
+	// realizeMu (issue #47: apply used to write both fields unlocked while
+	// concurrent Gets read them). The cached fast path never touches the
+	// pair, so hot reads stay lock-free.
+	procs       []driver.Processor
 	dynamicFrom int
 
-	// fallback is called when path resolution cannot find a matching child.
-	fallback driver.Processor
+	// fallback is called when path resolution cannot find a matching
+	// child. Swapped atomically by SetFallback for the same reason
+	// (issue #47); a nil pointer means no fallback is installed.
+	fallback atomic.Pointer[driver.Processor]
 
 	// Lazy Mode:
 	// In Lazy Mode, tree nodes are not created or calculated during initialization.
@@ -73,7 +77,10 @@ type tree struct {
 	rlMu        sync.RWMutex
 	rateLimiter *rate.Limiter
 
-	defaultCtx *driver.RealizeContext
+	// defaultCtx is swapped atomically by SetDefaultContext (issue #47):
+	// it is read on every realize without a request context and copied
+	// into new subtrees, both previously unsynchronized.
+	defaultCtx atomic.Pointer[driver.RealizeContext]
 }
 
 func (t *tree) lazy() *tree {
@@ -206,7 +213,7 @@ func (q pathQuery) name(level int) string {
 func (t *tree) getWithParent(parentContent []byte, q pathQuery) ([]byte, error) {
 	// Only the static prefix of the chain is realized into the cache;
 	// the dynamic layer needs request params and is skipped here.
-	if err := t.realizeWithParent(parentContent, t.staticProcs()); err != nil {
+	if err := t.realizeWithParent(parentContent); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
@@ -249,7 +256,7 @@ func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []b
 		rc.TreePath = t.path
 	}
 
-	if err := t.realizeWithParentCtx(rc, parentContent, t.staticProcs()); err != nil {
+	if err := t.realizeWithParentCtx(rc, parentContent); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
@@ -274,6 +281,10 @@ func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []b
 
 // staticProcs returns the cacheable prefix of the processor chain:
 // everything before the first param-aware processor.
+//
+// Callers must hold realizeMu (read or write): the (procs, dynamicFrom)
+// pair is only consistent under the lock since Set/apply replaces it
+// in place (issue #47).
 func (t *tree) staticProcs() []driver.Processor {
 	return t.procs[:t.dynamicFrom]
 }
@@ -284,10 +295,15 @@ func (t *tree) staticProcs() []driver.Processor {
 // and no lock is needed beyond reading the base.
 func (t *tree) dynamicRealize(rc *driver.RealizeContext) ([]byte, error) {
 	content := t.get()
-	if t.dynamicFrom >= len(t.procs) {
+	// snapshot the dynamic layer under the read lock so a concurrent
+	// Set/apply cannot tear the (procs, dynamicFrom) pair (issue #47)
+	t.realizeMu.RLock()
+	dynamic := t.procs[t.dynamicFrom:]
+	t.realizeMu.RUnlock()
+	if len(dynamic) == 0 {
 		return content, nil // fully static chain: nothing to do per request
 	}
-	content, err := t.driver.Realize(rc, content, t.procs[t.dynamicFrom:]...)
+	content, err := t.driver.Realize(rc, content, dynamic...)
 	if err != nil {
 		return nil, fmt.Errorf("realize dynamic rule on %s fail: %w", t.Path(), err)
 	}
@@ -296,16 +312,22 @@ func (t *tree) dynamicRealize(rc *driver.RealizeContext) ([]byte, error) {
 
 // doFallback calls the fallback processor if set, otherwise returns content unchanged.
 func (t *tree) doFallback(rc *driver.RealizeContext, content []byte) ([]byte, error) {
-	if t.fallback == nil {
-		return content, nil
+	if fb := t.fallback.Load(); fb != nil {
+		return (*fb).Process(rc, content)
 	}
-	return t.fallback.Process(rc, content)
+	return content, nil
 }
 
 // SetFallback sets a processor to handle cases where path resolution
 // cannot find a matching child node, and propagates it to all subtrees.
+// A nil processor CLEARS the fallback (missing paths then return the
+// node content unchanged), matching the pre-atomic behavior.
 func (t *tree) SetFallback(proc driver.Processor) {
-	t.fallback = proc
+	if proc == nil {
+		t.fallback.Store(nil) // clear, not a pointer to a nil interface
+	} else {
+		t.fallback.Store(&proc)
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for _, child := range t.children {
@@ -317,7 +339,7 @@ func (t *tree) SetFallback(proc driver.Processor) {
 
 // SetDefaultContext sets the default RealizeContext for this tree and all subtrees.
 func (t *tree) SetDefaultContext(rc *driver.RealizeContext) {
-	t.defaultCtx = rc
+	t.defaultCtx.Store(rc)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for _, child := range t.children {
@@ -409,12 +431,9 @@ func (t *tree) Graft(child Tree) {
 // newSubTree create a new sub tree.
 // name cannot be empty
 func (t *tree) newSubTree(name string) Tree {
-	return &tree{
+	child := &tree{
 		name: name,
 		path: t.driver.AppendPath(t.path, name),
-
-		defaultCtx: t.defaultCtx,
-		fallback:   t.fallback,
 
 		driver:      t.driver,
 		lazyMode:    t.lazyMode,
@@ -429,30 +448,39 @@ func (t *tree) newSubTree(name string) Tree {
 		content:  t.get(),
 		children: make(map[string]Tree),
 	}
+	// inherit the management fields through their atomic slots (issue #47:
+	// plain field copies raced SetFallback/SetDefaultContext)
+	child.defaultCtx.Store(t.defaultCtx.Load())
+	child.fallback.Store(t.fallback.Load())
+	return child
 }
 
 // updateDirective parse raw rule Processor to tree node.
+//
+// The field writes, the cache invalidation and (in standard mode) the
+// re-realization all happen inside ONE realizeMu write-locked critical
+// section (issue #47: the writes used to be unsynchronized, racing
+// concurrent Gets; keeping them in a single section also means no reader
+// can pass the fast path between the chain swap and the invalidation and
+// then pin the OLD chain's output as fresh). Standard-mode realize under
+// the write lock matches the previous effective behavior — the slow path
+// of realizeWithParentCtx always ran driver.Realize under this lock.
 func (t *tree) apply(procs ...driver.Processor) error {
+	t.realizeMu.Lock()
+	defer t.realizeMu.Unlock()
 	t.procs = procs
 	t.dynamicFrom = dynamicSplit(procs)
-	t.invalidateCache()
+	// invalidateCache, inlined to stay in the same critical section:
+	// mark the cached realization stale so the next realize re-runs the
+	// chain (without this, the fast path in realizeWithParentCtx keeps
+	// serving the old content forever when cacheTTL == 0).
+	t.realizedAt = time.Time{}
 	if t.lazyMode {
 		return nil
 	}
-	// standard mode: realize only the static prefix at build time;
-	// the dynamic layer is applied per query in GetWithContext.
-	return t.realize(t.staticProcs())
-}
-
-// invalidateCache marks the cached realization as stale so the next
-// realize re-runs the chain. Set() may replace a node's processors after
-// the node has already been realized; without invalidation the fast path
-// in realizeWithContext keeps serving the old content forever when
-// cacheTTL == 0 (which caches indefinitely).
-func (t *tree) invalidateCache() {
-	t.realizeMu.Lock()
-	defer t.realizeMu.Unlock()
-	t.realizedAt = time.Time{}
+	// standard mode: realize only the static prefix at build time; the
+	// dynamic layer is applied per query in GetWithContext.
+	return t.realizeLocked(t.defaultCtx.Load(), nil)
 }
 
 // dynamicSplit returns the index of the first param-aware processor.
@@ -472,12 +500,8 @@ func dynamicSplit(procs []driver.Processor) int {
 	return len(procs)
 }
 
-func (t *tree) realize(procs []driver.Processor) error {
-	return t.realizeWithParentCtx(t.defaultCtx, nil, procs)
-}
-
-func (t *tree) realizeWithParent(parentContent []byte, procs []driver.Processor) error {
-	return t.realizeWithParentCtx(t.defaultCtx, parentContent, procs)
+func (t *tree) realizeWithParent(parentContent []byte) error {
+	return t.realizeWithParentCtx(t.defaultCtx.Load(), parentContent)
 }
 
 // realizeWithParentCtx realizes the node's chain, deciding the lazy-mode
@@ -487,11 +511,13 @@ func (t *tree) realizeWithParent(parentContent []byte, procs []driver.Processor)
 // concurrent re-realization could complete in between: the node then either
 // composed from its own previous output (compounding) or had its fresh
 // result clobbered with raw parent content while realizedAt stayed fresh.
-func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []byte, procs []driver.Processor) error {
+func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []byte) error {
 	if rc == nil {
-		rc = t.defaultCtx
+		rc = t.defaultCtx.Load()
 	}
 	// Fast path: read lock checks whether realization can be skipped.
+	// The processor chain is NOT read here — it lives under the write
+	// lock only, so the hot cached path stays free of chain access.
 	t.realizeMu.RLock()
 	if !t.instantMode && !t.realizedAt.IsZero() && (t.cacheTTL == 0 || time.Since(t.realizedAt) < t.cacheTTL) {
 		t.realizeMu.RUnlock()
@@ -508,6 +534,13 @@ func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []b
 		return nil
 	}
 
+	return t.realizeLocked(rc, parentContent)
+}
+
+// realizeLocked performs the realization itself. Callers must hold
+// realizeMu for writing. It reads the processor chain here, where the
+// (procs, dynamicFrom) pair is consistent (issue #47).
+func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte) error {
 	// Rate limiting applies to lazy/instant/cache modes only; standard mode
 	// realizes during build and is never limited.
 	if (t.lazyMode || t.instantMode || t.cacheTTL > 0) && !t.allow() {
@@ -524,7 +557,7 @@ func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []b
 		base = parentContent
 	}
 
-	rule, err := t.driver.Realize(rc, base, procs...)
+	rule, err := t.driver.Realize(rc, base, t.staticProcs()...)
 	if err != nil {
 		return fmt.Errorf("realize rule fail: %w", err)
 	}
