@@ -39,7 +39,7 @@ func GetRule(c *gin.Context) {
 		}
 	}
 
-	tree := f.Get(name)
+	tree := currentForest().Get(name)
 	if tree == nil {
 		// unknown or missing tree name must not panic: f.Get returns a nil
 		// Tree interface, and calling GetWithContext on it dereferences nil.
