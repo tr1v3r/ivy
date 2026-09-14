@@ -121,6 +121,43 @@ func TestGetRule_ErrorBranch(t *testing.T) {
 	}
 }
 
+func TestGetRule_MissingTree(t *testing.T) {
+	// W1: a missing or unknown ?name= used to panic GetRule (nil Tree
+	// interface method call). newTestRouter uses gin.New() without the
+	// Recovery middleware, so a regression panic crashes the test binary
+	// instead of being masked as a 500.
+	InitForest(func() ivy.Tree {
+		tree, err := ivy.NewLazyInstantTree[ivy.Directive](driver.NewJSONDriver(), treeName, `{}`)
+		if err != nil {
+			t.Fatalf("build tree fail: %s", err)
+		}
+		return tree
+	})
+
+	r := newTestRouter()
+
+	var testcases = []struct {
+		Name  string
+		Query string
+	}{
+		{"no name", "path=/"},
+		{"empty name", "name=&path=/"},
+		{"unknown name", "name=missing&path=/"},
+	}
+	for _, item := range testcases {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/rule?"+item.Query, nil))
+
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s: expect 404, got %d (body: %s)", item.Name, w.Code, w.Body.String())
+			continue
+		}
+		if !strings.Contains(w.Body.String(), "not found") {
+			t.Errorf("%s: expected not-found payload, got %s", item.Name, w.Body.String())
+		}
+	}
+}
+
 func TestWebDriverName(t *testing.T) {
 	if name := (webDriver{}).Name(); name != "default" {
 		t.Errorf("unexpected web driver name: %s", name)
