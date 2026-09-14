@@ -339,3 +339,52 @@ func TestTree_DuplicateDirectivesLastWins(t *testing.T) {
 		t.Fatalf("duplicate directives: expect last one %q to win, got %q", "second", val)
 	}
 }
+
+// TestTree_SetFallbackNilClears guards review finding M-1 on the #47 fix:
+// SetFallback(nil) must CLEAR the fallback (the documented pre-fix
+// behavior). The atomic slot briefly wrapped the nil interface in a
+// non-nil *driver.Processor, so doFallback called Process on a nil
+// interface and the first fallback-path Get panicked.
+func TestTree_SetFallbackNilClears(t *testing.T) {
+	tree, err := NewTree(newTestDriver(), "fb_nil_clear", `{"base":true}`,
+		NewDirective("/", &driver.JSONProcessor{T: "create", JSONPath: "root", V: []byte("yes")}),
+	)
+	if err != nil {
+		t.Fatalf("build fail: %s", err)
+	}
+
+	const rootContent = `{"base":true,"root":"yes"}`
+	marker := &driver.RawProcessor{Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
+		return append(before, []byte(`,"fb":true}`)...), nil
+	}}
+
+	// a set fallback fires and is visible
+	tree.SetFallback(marker)
+	got, err := tree.Get("/missing")
+	if err != nil {
+		t.Fatalf("get with fallback fail: %s", err)
+	}
+	if !containsJSON(string(got), `"fb":true`) {
+		t.Fatalf("fallback not applied: %s", got)
+	}
+
+	// SetFallback(nil) clears: no panic, base content returned unchanged
+	tree.SetFallback(nil)
+	cleared, err := tree.Get("/missing2")
+	if err != nil {
+		t.Fatalf("get after SetFallback(nil) fail: %s", err)
+	}
+	if string(cleared) != rootContent {
+		t.Fatalf("after SetFallback(nil): got %q, want base content %q", cleared, rootContent)
+	}
+
+	// a later SetFallback still works after clearing
+	tree.SetFallback(marker)
+	again, err := tree.Get("/missing3")
+	if err != nil {
+		t.Fatalf("get after re-set fallback fail: %s", err)
+	}
+	if !containsJSON(string(again), `"fb":true`) {
+		t.Fatalf("fallback not re-applied after clear: %s", again)
+	}
+}

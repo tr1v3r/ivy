@@ -320,8 +320,14 @@ func (t *tree) doFallback(rc *driver.RealizeContext, content []byte) ([]byte, er
 
 // SetFallback sets a processor to handle cases where path resolution
 // cannot find a matching child node, and propagates it to all subtrees.
+// A nil processor CLEARS the fallback (missing paths then return the
+// node content unchanged), matching the pre-atomic behavior.
 func (t *tree) SetFallback(proc driver.Processor) {
-	t.fallback.Store(&proc)
+	if proc == nil {
+		t.fallback.Store(nil) // clear, not a pointer to a nil interface
+	} else {
+		t.fallback.Store(&proc)
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for _, child := range t.children {
