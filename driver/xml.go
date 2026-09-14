@@ -164,40 +164,130 @@ func xmlToNodes(data []byte) (*xmlNode, error) {
 }
 
 // nodesToXML serializes an xmlNode tree back to XML bytes.
+//
+// The tree stores namespace URIs (xml.Name.Space, as resolved by the
+// decoder) plus the original xmlns attributes. Re-encoding those tokens
+// through encoding/xml would make the encoder synthesize its own namespace
+// declarations: default-namespace elements gain a duplicate xmlns attribute
+// and prefixed declarations resurface as synthesized _xmlns attributes.
+// The writer below therefore emits the markup itself, resolving each
+// element/attribute name to the prefix declared for its namespace URI in
+// scope, so the document's namespaces survive the round trip unchanged.
 func nodesToXML(root *xmlNode) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	buf.WriteString(xml.Header)
-	enc := xml.NewEncoder(buf)
 	for _, child := range root.Children {
-		if err := writeXMLNode(enc, child); err != nil {
+		if err := writeXMLNode(buf, nil, child); err != nil {
 			return nil, err
 		}
-	}
-	if err := enc.Flush(); err != nil {
-		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-func writeXMLNode(enc *xml.Encoder, node *xmlNode) error {
-	start := xml.StartElement{Name: node.Name, Attr: node.Attr}
-	if err := enc.EncodeToken(start); err != nil {
-		return err
+// nsBinding is one namespace declaration in scope: prefix "" is the
+// default namespace.
+type nsBinding struct {
+	prefix string
+	uri    string
+}
+
+// writeXMLNode writes node and its subtree; scope holds the namespace
+// bindings declared by node's ancestors.
+func writeXMLNode(buf *bytes.Buffer, scope []nsBinding, node *xmlNode) error {
+	scope = appendScope(scope, node.Attr)
+
+	name := qualifiedName(scope, node.Name)
+	buf.WriteByte('<')
+	buf.WriteString(name)
+	for _, attr := range node.Attr {
+		buf.WriteByte(' ')
+		switch {
+		case attr.Name.Space == "xmlns":
+			// declaration of a prefix: xmlns:p="uri"
+			buf.WriteString("xmlns:" + attr.Name.Local)
+		case attr.Name.Space == "" && attr.Name.Local == "xmlns":
+			// declaration of the default namespace: xmlns="uri"
+			buf.WriteString("xmlns")
+		default:
+			buf.WriteString(qualifiedName(scope, attr.Name))
+		}
+		buf.WriteString(`="`)
+		if err := xml.EscapeText(buf, []byte(attr.Value)); err != nil {
+			return err
+		}
+		buf.WriteByte('"')
 	}
+	buf.WriteByte('>')
+
 	if node.Text != "" {
-		if err := enc.EncodeToken(xml.CharData(node.Text)); err != nil {
+		if err := xml.EscapeText(buf, []byte(node.Text)); err != nil {
 			return err
 		}
 	}
 	for _, child := range node.Children {
-		if err := writeXMLNode(enc, child); err != nil {
+		if err := writeXMLNode(buf, scope, child); err != nil {
 			return err
 		}
 	}
-	if err := enc.EncodeToken(xml.EndElement{Name: node.Name}); err != nil {
-		return err
-	}
+
+	buf.WriteString("</")
+	buf.WriteString(name)
+	buf.WriteByte('>')
 	return nil
+}
+
+// appendScope returns scope extended with the xmlns declarations in attrs.
+// The returned slice never aliases the input, so sibling subtrees cannot
+// observe each other's redeclarations.
+func appendScope(scope []nsBinding, attrs []xml.Attr) []nsBinding {
+	var added []nsBinding
+	for _, attr := range attrs {
+		switch {
+		case attr.Name.Space == "xmlns":
+			added = append(added, nsBinding{prefix: attr.Name.Local, uri: attr.Value})
+		case attr.Name.Space == "" && attr.Name.Local == "xmlns":
+			added = append(added, nsBinding{prefix: "", uri: attr.Value})
+		}
+	}
+	if len(added) == 0 {
+		return scope
+	}
+	out := make([]nsBinding, 0, len(scope)+len(added))
+	out = append(out, scope...)
+	for _, binding := range added {
+		replaced := false
+		for i := range out {
+			if out[i].prefix == binding.prefix {
+				out[i] = binding // redeclaration overrides in place
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, binding)
+		}
+	}
+	return out
+}
+
+// qualifiedName renders name as prefix:local when name.Space is bound to a
+// non-empty prefix in scope, as plain local when it is bound to the default
+// namespace or carries no namespace, and falls back to the local name when
+// no binding is in scope (the decoder resolved it from an outer scope that
+// the tree no longer carries).
+func qualifiedName(scope []nsBinding, name xml.Name) string {
+	if name.Space == "" {
+		return name.Local
+	}
+	for i := len(scope) - 1; i >= 0; i-- {
+		if scope[i].uri == name.Space {
+			if scope[i].prefix == "" {
+				return name.Local
+			}
+			return scope[i].prefix + ":" + name.Local
+		}
+	}
+	return name.Local
 }
 
 // --- path helpers ---
