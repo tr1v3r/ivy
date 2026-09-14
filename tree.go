@@ -448,6 +448,14 @@ func (t *tree) Graft(child Tree) {
 // newSubTree create a new sub tree.
 // name cannot be empty
 func (t *tree) newSubTree(name string) Tree {
+	// one pair read pins (content, version) together: three separate
+	// locked reads could observe a parent set() in between and hand the
+	// child an inherited snapshot labeled with a version it never came
+	// from (review finding on #80; near-zero impact since build is
+	// single-threaded and lazy children recompose on first access, but
+	// the pair read closes the window for free)
+	snapshot, parentVer := t.getWithVersion()
+
 	child := &tree{
 		name: name,
 		path: t.driver.AppendPath(t.path, name),
@@ -458,15 +466,15 @@ func (t *tree) newSubTree(name string) Tree {
 		cacheTTL:    t.cacheTTL,
 
 		level: t.level + 1,
-		base:  t.get(),
+		base:  snapshot,
 		// content starts as the inherited snapshot so never-realized
 		// intermediate nodes still carry the parent content down the chain
 		// (standard-mode build); realize overwrites it from base.
-		content: t.get(),
+		content: snapshot,
 		// the snapshot derives from the parent's CURRENT publication, so
 		// descents can compare against it until the first own realization
 		// stores what it actually composed from (issue #48)
-		realizedFrom: t.version(),
+		realizedFrom: parentVer,
 		children:     make(map[string]Tree),
 	}
 	// inherit the management fields through their atomic slots (issue #47:
@@ -627,13 +635,6 @@ func (t *tree) getWithVersion() (content []byte, version uint64) {
 	t.contentMu.RLock()
 	defer t.contentMu.RUnlock()
 	return t.content, t.contentVer
-}
-
-// version returns the node's current publication version.
-func (t *tree) version() uint64 {
-	t.contentMu.RLock()
-	defer t.contentMu.RUnlock()
-	return t.contentVer
 }
 
 // get return current node rule.
