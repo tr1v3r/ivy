@@ -16,17 +16,12 @@ package ivy
 //	TestStressSetFallbackDuringGet        SetFallback swaps vs fallback-serving Gets (#47 fixed)
 //	TestStressSetDefaultContextDuringGet  SetDefaultContext swaps vs realizing Gets (#47 fixed)
 //	TestStressSetProcsSwapDuringGet       Set/apply chain swaps vs Gets (#47 fixed)
-//
-// The remaining known semantics gap is exercised only behind an opt-in
-// gate so the default CI run (which is `go test -race ./...`) stays green:
-//
-//	TestStressKnownRace48_ParentRefreshStaleChild   t.Skip unless IVY_STRESS_UNFIXED=1 (issue #48)
+//	TestStressParentRefreshChildRecomposes parent TTL refresh propagates to cached children (#48 fixed)
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -718,28 +713,17 @@ func TestStressRateLimiterSwapConsistency(t *testing.T) {
 	t.Logf("admitted=%d limited=%d", admitted, limited)
 }
 
-// --- Set-family races (#47, FIXED) and the remaining known gap (#48) ----
+// --- Set-family races (#47) and stale-child compositions (#48), FIXED ---
 //
 // The three #47 regression guards below used to be env-gated probes that
 // demonstrated the unsynchronized SetFallback/SetDefaultContext/Set-apply
-// writes (1038 DATA RACE warnings on a 64-goroutine load). The fix
-// publishes procs/dynamicFrom/fallback/defaultCtx atomically, so they now
-// run unconditionally — including under -race in CI.
+// writes (1038 DATA RACE warnings on a 64-goroutine load). The fix keeps
+// the chain under realizeMu and the management fields atomic, so they run
+// unconditionally — including under -race in CI.
 //
-// #48 (parent TTL refresh leaves a stale child composition) is still
-// open: its probe stays opt-in behind IVY_STRESS_UNFIXED=1 and encodes the
-// FIXED contract, so it FAILS when run manually:
-//
-//	IVY_STRESS_UNFIXED=1 go test -run 'TestStressKnownRace48' -v .
-//	    → FAIL "served stale composition" (child TTL pins old parent
-//	      content while the parent already re-realized)
-
-func skipUnlessUnfixedStress(t *testing.T, issue string) {
-	t.Helper()
-	if os.Getenv("IVY_STRESS_UNFIXED") == "" {
-		t.Skipf("known open race/semantics gap, see #%s; set IVY_STRESS_UNFIXED=1 to run this regression probe", issue)
-	}
-}
+// The #48 guard likewise used to be gated behind IVY_STRESS_UNFIXED=1 (it
+// demonstrated the stale "P1-L" composition). The min(own TTL, parent
+// publication) freshness rule fixes it; it is a regular regression now.
 
 // TestStressSetFallbackDuringGet guards #47: SetFallback swaps the
 // fallback processor while concurrent Gets hit a missing path (fallback
@@ -910,17 +894,16 @@ func TestStressSetProcsSwapDuringGet(t *testing.T) {
 	fails.report(t, atomic.LoadInt64(&anomalies))
 }
 
-// TestStressKnownRace48_ParentRefreshStaleChild encodes the FIXED contract
-// for #48: a child must not keep serving a composition built from a parent
-// realization that the parent has already superseded.
+// TestStressParentRefreshChildRecomposes guards #48: a child must not
+// keep serving a composition built from a parent realization that the
+// parent has already superseded (the old stale window lasted up to one
+// child TTL and served "P1-L" here).
 //
-// The stale window is opened deterministically (no timing race): the
-// parent's realizedAt is rewound under its lock — exactly what natural TTL
-// expiry does — while the leaf stays fresh. On master the leaf fast-path
-// then serves the OLD composition for up to a full leaf TTL.
-func TestStressKnownRace48_ParentRefreshStaleChild(t *testing.T) {
-	skipUnlessUnfixedStress(t, "48")
-
+// The window is opened deterministically (no timing race): the parent's
+// realizedAt is rewound under its lock — exactly what natural TTL expiry
+// does — while the leaf stays fresh. With the min(own TTL, parent
+// publication) freshness rule the leaf recomposes immediately.
+func TestStressParentRefreshChildRecomposes(t *testing.T) {
 	var gen int32
 	parentProc := &driver.RawProcessor{Proc: func(_ *driver.RealizeContext, _ []byte) ([]byte, error) {
 		n := atomic.AddInt32(&gen, 1)
@@ -974,8 +957,8 @@ func TestStressKnownRace48_ParentRefreshStaleChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("leaf get fail: %s", err)
 	}
-	// desired contract: leaf recomposes from the CURRENT parent content
+	// fixed contract: leaf recomposes from the CURRENT parent content
 	if string(afterLeaf) != "P2-L" {
-		t.Errorf("issue #48: leaf served stale composition %q after parent refresh, want %q", afterLeaf, "P2-L")
+		t.Errorf("leaf served stale composition %q after parent refresh, want %q (issue #48 regression)", afterLeaf, "P2-L")
 	}
 }
