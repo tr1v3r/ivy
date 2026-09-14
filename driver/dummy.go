@@ -6,6 +6,19 @@ import (
 
 var _ Driver = (*DummyDriver)(nil)
 
+var _ SegmentParser = (*DummyDriver)(nil)
+
+// ParseSegments forwards to the embedded parser when it supports segment
+// parsing, letting the engine split a queried path once per descent
+// instead of once per tree level. Custom embedded parsers without
+// SegmentParser support report ok=false and keep the per-call path.
+func (d DummyDriver) ParseSegments(path string) ([]string, bool) {
+	if sp, ok := d.PathParser.(SegmentParser); ok {
+		return sp.ParseSegments(path)
+	}
+	return nil, false
+}
+
 // DummyModem is a no-op Modem for drivers whose processors never
 // serialize: Marshal returns nil and Unmarshal succeeds without reading.
 var DummyModem = &GeneralModem[Processor]{

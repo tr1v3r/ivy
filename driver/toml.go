@@ -12,6 +12,19 @@ import (
 // check interface
 var _ Driver = (*TOMLDriver)(nil)
 
+var _ SegmentParser = (*TOMLDriver)(nil)
+
+// ParseSegments forwards to the embedded parser when it supports segment
+// parsing, letting the engine split a queried path once per descent
+// instead of once per tree level. Custom embedded parsers without
+// SegmentParser support report ok=false and keep the per-call path.
+func (d TOMLDriver) ParseSegments(path string) ([]string, bool) {
+	if sp, ok := d.PathParser.(SegmentParser); ok {
+		return sp.ParseSegments(path)
+	}
+	return nil, false
+}
+
 // NewTOMLDriver create a new toml driver
 func NewTOMLDriver() *TOMLDriver {
 	return &TOMLDriver{

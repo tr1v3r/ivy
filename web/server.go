@@ -140,3 +140,17 @@ type webDriver struct {
 }
 
 func (webDriver) Name() string { return "default" }
+
+var _ driver.SegmentParser = (*webDriver)(nil)
+
+// ParseSegments forwards to the embedded parser when it supports segment
+// parsing (see driver.SegmentParser): the engine then splits a queried
+// path once per descent instead of once per tree level. Custom embedded
+// parsers without SegmentParser support report ok=false and keep the
+// per-call path.
+func (d webDriver) ParseSegments(path string) ([]string, bool) {
+	if sp, ok := d.PathParser.(driver.SegmentParser); ok {
+		return sp.ParseSegments(path)
+	}
+	return nil, false
+}

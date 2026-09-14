@@ -11,6 +11,19 @@ import (
 // check interface
 var _ Driver = (*JSONDriver)(nil)
 
+var _ SegmentParser = (*JSONDriver)(nil)
+
+// ParseSegments forwards to the embedded parser when it supports segment
+// parsing, letting the engine split a queried path once per descent
+// instead of once per tree level. Custom embedded parsers without
+// SegmentParser support report ok=false and keep the per-call path.
+func (d JSONDriver) ParseSegments(path string) ([]string, bool) {
+	if sp, ok := d.PathParser.(SegmentParser); ok {
+		return sp.ParseSegments(path)
+	}
+	return nil, false
+}
+
 // NewJSONDriver create a new json driver
 func NewJSONDriver() *JSONDriver {
 	return &JSONDriver{
