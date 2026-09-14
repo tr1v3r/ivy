@@ -74,7 +74,8 @@ func currentForest() ivy.Forest {
 }
 
 // InitForest builds the process-wide forest from the given tree builders.
-// Call once during startup, before serving requests.
+// Safe to call again later (e.g. a SIGHUP reload): the swap holds forestMu,
+// so concurrent readers never observe a torn forest.
 func InitForest(builders ...ivy.TreeBuilder) {
 	forestMu.Lock()
 	defer forestMu.Unlock()
@@ -89,6 +90,26 @@ func InitForest(builders ...ivy.TreeBuilder) {
 // (the 5s refresh goroutine in cmd/serve wrote `f` while handlers read
 // it — caught by -race as write server.go / read handler.go).
 func RefreshForest() { currentForest().Build() }
+
+// DefaultCacheBuilder returns a TreeBuilder for the tree named "default":
+// a lazy tree with cache TTL. Content is realized on the first access and
+// re-realized (re-running every processor, e.g. curl fetches for rule
+// URLs) on the first access after the TTL expires — no background timer
+// and nothing is replayed without traffic. Use DefaultBuilder for the
+// standard build-once behavior.
+func DefaultCacheBuilder(ttl time.Duration, directives ...ivy.Directive) ivy.TreeBuilder {
+	return func() ivy.Tree {
+		tree, err := ivy.NewLazyCacheTree(&webDriver{PathParser: driver.SlashPathParser, Modem: driver.DummyModem},
+			treeName, `{}`, ttl, directives...)
+		if err != nil {
+			// Mirror DefaultBuilder: log and yield nil rather than panic
+			// (forest.Build skips nil trees and keeps the old one).
+			log.Error("build default cache tree fail: %s", err)
+			return nil
+		}
+		return tree
+	}
+}
 
 // DefaultBuilder returns a TreeBuilder for the tree named "default":
 // a standard-mode JSON tree rooted at `{}` with the given directives.

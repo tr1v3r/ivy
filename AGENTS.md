@@ -135,6 +135,7 @@ uses their static content.
 
 - `RULES_FILE`: Path to directives configuration file (default: `../../conf/rules.json`)
 - `SHUTDOWN_TIMEOUT`: Server shutdown timeout (default: `3s`)
+- `RULES_TTL`: Cache TTL for rule trees, e.g. `5m`. When positive, the default tree becomes lazy+cache-TTL: content is realized on first access and re-realized (re-running processors such as curl rule URLs) on the first access after each TTL window. Zero/invalid (default) keeps build-once standard mode. Rule-file changes can be picked up at runtime with SIGHUP.
 
 ### Directives File Format
 
