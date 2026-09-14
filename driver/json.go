@@ -85,6 +85,11 @@ func (op *JSONProcessor) Process(_ *RealizeContext, before []byte) (after []byte
 	case "create", "append", "replace":
 		return sjson.SetBytes(before, op.JSONPath, op.V)
 	case "set":
+		// SetRawBytes embeds V verbatim; an empty V would splice nothing into
+		// the document and emit invalid JSON such as {"a":1,"family":}.
+		if len(op.V) == 0 {
+			return nil, fmt.Errorf("json processor set on %s with empty value would produce invalid JSON", op.JSONPath)
+		}
 		return sjson.SetRawBytes(before, op.JSONPath, op.V)
 	case "delete":
 		return sjson.DeleteBytes(before, op.JSONPath)
