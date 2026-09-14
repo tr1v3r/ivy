@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -156,6 +157,56 @@ func TestGetRule_MissingTree(t *testing.T) {
 			t.Errorf("%s: expected not-found payload, got %s", item.Name, w.Body.String())
 		}
 	}
+}
+
+// TestRefreshForest_ConcurrentWithRequests guards the W2 data race:
+// cmd/serve's ticker goroutine calls RefreshForest every 5s while every
+// request reads the forest in GetRule. RefreshForest used to reassign the
+// global `f`, which -race reported as write web/server.go vs read
+// web/handler.go. Run with `go test -race` for the discriminator; without
+// -race it still exercises the concurrent path.
+func TestRefreshForest_ConcurrentWithRequests(t *testing.T) {
+	InitForest(DefaultBuilder())
+
+	r := newTestRouter()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// cmd/serve's refresh ticker equivalent
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				RefreshForest()
+			}
+		}
+	}()
+
+	// request load
+	var reqWg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		reqWg.Add(1)
+		go func() {
+			defer reqWg.Done()
+			for j := 0; j < 50; j++ {
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/rule?name=default&path=/", nil))
+				if w.Code != http.StatusOK {
+					t.Errorf("unexpected status %d (body: %s)", w.Code, w.Body.String())
+					return
+				}
+			}
+		}()
+	}
+
+	reqWg.Wait()
+	close(stop)
+	wg.Wait()
 }
 
 func TestWebDriverName(t *testing.T) {

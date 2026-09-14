@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/tr1v3r/pkg/guard"
@@ -22,8 +23,6 @@ import (
 )
 
 const treeName = "default"
-
-var f ivy.Forest
 
 // Serve starts the HTTP server on :8080 and blocks until a shutdown
 // signal arrives, then drains in-flight requests within timeout.
@@ -59,13 +58,38 @@ func Serve(timeout time.Duration, handler http.Handler) {
 	log.Info("Server exiting")
 }
 
+// f is the process-wide forest. All access goes through forestMu (or the
+// startup-only InitForest write): cmd/serve refreshes the forest from a
+// background ticker goroutine while HTTP handlers read it on every request,
+// so an unsynchronized swap here is a data race (torn interface reads).
+var (
+	forestMu sync.RWMutex
+	f        ivy.Forest
+)
+
+// currentForest returns the process-wide forest.
+func currentForest() ivy.Forest {
+	forestMu.RLock()
+	defer forestMu.RUnlock()
+	return f
+}
+
 // InitForest builds the process-wide forest from the given tree builders.
 // Call once during startup, before serving requests.
-func InitForest(builders ...ivy.TreeBuilder) { f = ivy.NewForest(builders...) }
+func InitForest(builders ...ivy.TreeBuilder) {
+	forestMu.Lock()
+	defer forestMu.Unlock()
+	f = ivy.NewForest(builders...)
+}
 
 // RefreshForest rebuilds every tree in the forest by re-running its
 // builder, picking up directive changes since the last build.
-func RefreshForest() { f = f.Build() }
+//
+// It must not reassign the global: Build() mutates and returns the same
+// forest instance, so reassigning raced concurrent readers in GetRule
+// (the 5s refresh goroutine in cmd/serve wrote `f` while handlers read
+// it — caught by -race as write server.go / read handler.go).
+func RefreshForest() { currentForest().Build() }
 
 // DefaultBuilder returns a TreeBuilder for the tree named "default":
 // a standard-mode JSON tree rooted at `{}` with the given directives.
