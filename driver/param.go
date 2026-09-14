@@ -99,6 +99,33 @@ func Params(rc *RealizeContext) map[string]string {
 	return rc.Params
 }
 
+// IsParamAware reports whether proc's output depends on RealizeContext.Params,
+// looking through *CombinedProcessor chains: a combined processor whose inner
+// chain contains a param-aware processor is itself param-aware, while fully
+// static combinations keep their static (cacheable) treatment.
+//
+// Engine code splitting a processor chain into a cacheable static prefix and
+// a per-request dynamic layer must use this helper instead of a plain
+// ParamAware type assertion, otherwise param-dependent output produced by a
+// combined chain is cached and served unchanged to requests with different
+// params.
+func IsParamAware(proc Processor) bool {
+	if proc == nil {
+		return false
+	}
+	if _, ok := proc.(ParamAware); ok {
+		return true
+	}
+	if combined, ok := proc.(*CombinedProcessor); ok {
+		for _, inner := range combined.procs {
+			if IsParamAware(inner) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Render substitutes every ${key} placeholder in tpl with the matching
 // param value. Missing keys render as empty strings, so an unparametrized
 // query yields the template with placeholders stripped.

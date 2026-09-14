@@ -413,7 +413,10 @@ func dynamicSplit(procs []driver.Processor) int {
 		if proc == nil {
 			continue
 		}
-		if _, ok := proc.(driver.ParamAware); ok {
+		// IsParamAware also looks through *CombinedProcessor chains, so a
+		// combined chain containing a param-aware processor stays in the
+		// dynamic layer instead of caching request-specific output.
+		if driver.IsParamAware(proc) {
 			return i
 		}
 	}
