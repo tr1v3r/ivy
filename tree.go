@@ -29,6 +29,12 @@ type tree struct {
 	// current node rule
 	contentMu sync.RWMutex
 	content   []byte
+	// contentVer counts this node's content publications (bumped by every
+	// set). Descendants read it together with the content and remember the
+	// version they composed from (realizedFrom), so a node whose parent
+	// re-realized can detect the staleness of its own cached composition
+	// (issue #48) instead of serving it until its own TTL expires.
+	contentVer uint64
 
 	// base is the pre-processor content the chain is applied to: the root
 	// template for the root node, the parent's realized content for children.
@@ -73,6 +79,12 @@ type tree struct {
 	cacheTTL   time.Duration
 	realizeMu  sync.RWMutex
 	realizedAt time.Time
+	// realizedFrom is the parent's contentVer this node last composed
+	// from; guarded by realizeMu. A descent carrying a NEWER parent
+	// version invalidates the cached composition (issue #48); an EQUAL or
+	// OLDER version leaves it alone (older = stale carry, the cache is
+	// already based on newer parent content than the caller saw).
+	realizedFrom uint64
 
 	rlMu        sync.RWMutex
 	rateLimiter *rate.Limiter
@@ -156,7 +168,7 @@ func (t *tree) Get(path string) ([]byte, error) {
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
-	return t.getWithParent(nil, newPathQuery(t.driver, path))
+	return t.getWithParent(nil, 0, newPathQuery(t.driver, path))
 }
 
 // pathQuery is one query's view of the queried path. The descent asks for
@@ -210,10 +222,10 @@ func (q pathQuery) name(level int) string {
 // write before it — that separation is what allowed the lazy+TTL race
 // where a late inheritance write clobbered a concurrently refreshed
 // result.
-func (t *tree) getWithParent(parentContent []byte, q pathQuery) ([]byte, error) {
+func (t *tree) getWithParent(parentContent []byte, parentVer uint64, q pathQuery) ([]byte, error) {
 	// Only the static prefix of the chain is realized into the cache;
 	// the dynamic layer needs request params and is skipped here.
-	if err := t.realizeWithParent(parentContent); err != nil {
+	if err := t.realizeWithParent(parentContent, parentVer); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
@@ -222,8 +234,12 @@ func (t *tree) getWithParent(parentContent []byte, q pathQuery) ([]byte, error) 
 	}
 
 	if child := t.pickChild(q.name(t.level + 1)); child != nil {
+		// carry this node's freshly published (content, version) pair so
+		// the child can detect that its cached composition is based on an
+		// outdated parent realization (issue #48)
+		content, ver := t.getWithVersion()
 		if ct, ok := child.(*tree); ok {
-			return ct.getWithParent(t.get(), q)
+			return ct.getWithParent(content, ver, q)
 		}
 		return child.Get(q.path)
 	}
@@ -246,17 +262,17 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
-	return t.getContextWithParent(rc, nil, newPathQuery(t.driver, path))
+	return t.getContextWithParent(rc, nil, 0, newPathQuery(t.driver, path))
 }
 
 // getContextWithParent is the GetWithContext descent carrying the parent's
 // realized content for atomic inheritance (see getWithParent).
-func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []byte, q pathQuery) ([]byte, error) {
+func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []byte, parentVer uint64, q pathQuery) ([]byte, error) {
 	if rc != nil {
 		rc.TreePath = t.path
 	}
 
-	if err := t.realizeWithParentCtx(rc, parentContent); err != nil {
+	if err := t.realizeWithParentCtx(rc, parentContent, parentVer); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
@@ -265,14 +281,15 @@ func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []b
 	}
 
 	if child := t.pickChild(q.name(t.level + 1)); child != nil {
-		// one content read serves both the context leak (ParentContent)
-		// and the descent's inheritance argument
-		content := t.get()
+		// one (content, version) read serves the context leak
+		// (ParentContent), the descent's inheritance argument and the
+		// child's staleness check (issue #48)
+		content, ver := t.getWithVersion()
 		if rc != nil {
 			rc.ParentContent = content
 		}
 		if ct, ok := child.(*tree); ok {
-			return ct.getContextWithParent(rc, content, q)
+			return ct.getContextWithParent(rc, content, ver, q)
 		}
 		return child.GetWithContext(rc, q.path)
 	}
@@ -431,6 +448,14 @@ func (t *tree) Graft(child Tree) {
 // newSubTree create a new sub tree.
 // name cannot be empty
 func (t *tree) newSubTree(name string) Tree {
+	// one pair read pins (content, version) together: three separate
+	// locked reads could observe a parent set() in between and hand the
+	// child an inherited snapshot labeled with a version it never came
+	// from (review finding on #80; near-zero impact since build is
+	// single-threaded and lazy children recompose on first access, but
+	// the pair read closes the window for free)
+	snapshot, parentVer := t.getWithVersion()
+
 	child := &tree{
 		name: name,
 		path: t.driver.AppendPath(t.path, name),
@@ -441,12 +466,16 @@ func (t *tree) newSubTree(name string) Tree {
 		cacheTTL:    t.cacheTTL,
 
 		level: t.level + 1,
-		base:  t.get(),
+		base:  snapshot,
 		// content starts as the inherited snapshot so never-realized
 		// intermediate nodes still carry the parent content down the chain
 		// (standard-mode build); realize overwrites it from base.
-		content:  t.get(),
-		children: make(map[string]Tree),
+		content: snapshot,
+		// the snapshot derives from the parent's CURRENT publication, so
+		// descents can compare against it until the first own realization
+		// stores what it actually composed from (issue #48)
+		realizedFrom: parentVer,
+		children:     make(map[string]Tree),
 	}
 	// inherit the management fields through their atomic slots (issue #47:
 	// plain field copies raced SetFallback/SetDefaultContext)
@@ -479,8 +508,11 @@ func (t *tree) apply(procs ...driver.Processor) error {
 		return nil
 	}
 	// standard mode: realize only the static prefix at build time; the
-	// dynamic layer is applied per query in GetWithContext.
-	return t.realizeLocked(t.defaultCtx.Load(), nil)
+	// dynamic layer is applied per query in GetWithContext. The chain is
+	// realized from the node's own base, which captures the parent
+	// publication the node was created from — keep realizedFrom pinned to
+	// that version so descents do not spuriously invalidate.
+	return t.realizeLocked(t.defaultCtx.Load(), nil, t.realizedFrom)
 }
 
 // dynamicSplit returns the index of the first param-aware processor.
@@ -500,8 +532,8 @@ func dynamicSplit(procs []driver.Processor) int {
 	return len(procs)
 }
 
-func (t *tree) realizeWithParent(parentContent []byte) error {
-	return t.realizeWithParentCtx(t.defaultCtx.Load(), parentContent)
+func (t *tree) realizeWithParent(parentContent []byte, parentVer uint64) error {
+	return t.realizeWithParentCtx(t.defaultCtx.Load(), parentContent, parentVer)
 }
 
 // realizeWithParentCtx realizes the node's chain, deciding the lazy-mode
@@ -511,15 +543,21 @@ func (t *tree) realizeWithParent(parentContent []byte) error {
 // concurrent re-realization could complete in between: the node then either
 // composed from its own previous output (compounding) or had its fresh
 // result clobbered with raw parent content while realizedAt stayed fresh.
-func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []byte) error {
+func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []byte, parentVer uint64) error {
 	if rc == nil {
 		rc = t.defaultCtx.Load()
 	}
 	// Fast path: read lock checks whether realization can be skipped.
 	// The processor chain is NOT read here — it lives under the write
 	// lock only, so the hot cached path stays free of chain access.
+	//
+	// Freshness is min(own TTL, parent publication) (issue #48): the
+	// cached composition is only served while it is based on the parent
+	// version the caller carries. parentVer < realizedFrom means the
+	// caller's carry is OLDER than what the cache already composed from —
+	// keep the newer cache.
 	t.realizeMu.RLock()
-	if !t.instantMode && !t.realizedAt.IsZero() && (t.cacheTTL == 0 || time.Since(t.realizedAt) < t.cacheTTL) {
+	if t.fresh(parentVer) {
 		t.realizeMu.RUnlock()
 		return nil
 	}
@@ -530,17 +568,32 @@ func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []b
 	defer t.realizeMu.Unlock()
 	// Double-check after acquiring the write lock, so concurrent goroutines
 	// that passed the fast path do not realize twice.
-	if !t.instantMode && !t.realizedAt.IsZero() && (t.cacheTTL == 0 || time.Since(t.realizedAt) < t.cacheTTL) {
+	if t.fresh(parentVer) {
 		return nil
 	}
 
-	return t.realizeLocked(rc, parentContent)
+	return t.realizeLocked(rc, parentContent, parentVer)
+}
+
+// fresh reports whether the cached realization may be served for a
+// descent carrying parentVer. Callers must hold realizeMu (read or
+// write). It encodes the min(own TTL, parent publication) freshness rule
+// of issue #48: an own-TTL-fresh cache composed from an outdated parent
+// version is stale and must recompose.
+func (t *tree) fresh(parentVer uint64) bool {
+	if t.instantMode || t.realizedAt.IsZero() {
+		return false
+	}
+	if t.cacheTTL != 0 && time.Since(t.realizedAt) >= t.cacheTTL {
+		return false
+	}
+	return parentVer <= t.realizedFrom
 }
 
 // realizeLocked performs the realization itself. Callers must hold
 // realizeMu for writing. It reads the processor chain here, where the
 // (procs, dynamicFrom) pair is consistent (issue #47).
-func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte) error {
+func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte, parentVer uint64) error {
 	// Rate limiting applies to lazy/instant/cache modes only; standard mode
 	// realizes during build and is never limited.
 	if (t.lazyMode || t.instantMode || t.cacheTTL > 0) && !t.allow() {
@@ -562,6 +615,7 @@ func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte) er
 		return fmt.Errorf("realize rule fail: %w", err)
 	}
 	t.set(rule)
+	t.realizedFrom = parentVer
 
 	t.realizedAt = time.Now()
 	return nil
@@ -571,6 +625,16 @@ func (t *tree) set(rule []byte) {
 	t.contentMu.Lock()
 	defer t.contentMu.Unlock()
 	t.content = rule
+	t.contentVer++ // a new publication for descendants' staleness checks
+}
+
+// getWithVersion returns the node's current content and its publication
+// version as one pair (both under contentMu), so a parent refresh between
+// two separate reads can never hand a child a torn combination.
+func (t *tree) getWithVersion() (content []byte, version uint64) {
+	t.contentMu.RLock()
+	defer t.contentMu.RUnlock()
+	return t.content, t.contentVer
 }
 
 // get return current node rule.
