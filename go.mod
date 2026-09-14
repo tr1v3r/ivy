@@ -7,7 +7,7 @@ require (
 	github.com/pelletier/go-toml/v2 v2.0.8
 	github.com/swaggo/files v1.0.1
 	github.com/swaggo/gin-swagger v1.6.1
-	github.com/swaggo/swag v1.16.2
+	github.com/swaggo/swag v1.16.6
 	github.com/tidwall/sjson v1.2.5
 	github.com/tr1v3r/pkg v0.1.8
 	github.com/tr1v3r/stream v0.1.0
@@ -46,7 +46,9 @@ require (
 	github.com/ugorji/go/codec v1.2.11 // indirect
 	golang.org/x/arch v0.3.0 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/mod v0.37.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
