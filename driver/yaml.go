@@ -14,6 +14,19 @@ import (
 
 var _ Driver = (*YAMLDriver)(nil)
 
+var _ SegmentParser = (*YAMLDriver)(nil)
+
+// ParseSegments forwards to the embedded parser when it supports segment
+// parsing, letting the engine split a queried path once per descent
+// instead of once per tree level. Custom embedded parsers without
+// SegmentParser support report ok=false and keep the per-call path.
+func (d YAMLDriver) ParseSegments(path string) ([]string, bool) {
+	if sp, ok := d.PathParser.(SegmentParser); ok {
+		return sp.ParseSegments(path)
+	}
+	return nil, false
+}
+
 // NewYAMLDriver creates a driver for YAML content with slash-separated
 // paths and JSON-encoded processor serialization.
 func NewYAMLDriver() *YAMLDriver {

@@ -12,14 +12,27 @@ import (
 	"github.com/tr1v3r/ivy/driver"
 )
 
+// testPathDriver is the driver shape used by the stress/benchmark suite.
+// The parser is embedded as the CONCRETE *DelimiterPathParser (not the
+// PathParser interface) so the composite implements driver.SegmentParser
+// and the engine's single-parse descent is what the suite exercises.
+//
+// A bundled driver type (DummyDriver) must NOT be embedded alongside:
+// DummyDriver forwards ParseSegments itself, so both embeddees would
+// provide it at the same depth, the selector would be ambiguous, and the
+// composite would silently lose SegmentParser (falling back to per-level
+// parsing). Name() is provided directly instead.
+type testPathDriver struct {
+	driver.Modem
+	*driver.DelimiterPathParser
+	driver.StdRealizer
+}
+
+func (testPathDriver) Name() string { return "test" }
+
 // newTestDriver returns a minimal driver composite for building test trees.
 func newTestDriver() driver.Driver {
-	return &struct {
-		driver.Modem
-		driver.PathParser
-		driver.StdRealizer
-		driver.DummyDriver
-	}{Modem: driver.DummyModem, PathParser: driver.SlashPathParser}
+	return &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: driver.SlashPathParser}
 }
 
 func TestForest_Lifecycle(t *testing.T) {

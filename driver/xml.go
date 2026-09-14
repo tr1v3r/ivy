@@ -12,6 +12,19 @@ import (
 // check interface
 var _ Driver = (*XMLDriver)(nil)
 
+var _ SegmentParser = (*XMLDriver)(nil)
+
+// ParseSegments forwards to the embedded parser when it supports segment
+// parsing, letting the engine split a queried path once per descent
+// instead of once per tree level. Custom embedded parsers without
+// SegmentParser support report ok=false and keep the per-call path.
+func (d XMLDriver) ParseSegments(path string) ([]string, bool) {
+	if sp, ok := d.PathParser.(SegmentParser); ok {
+		return sp.ParseSegments(path)
+	}
+	return nil, false
+}
+
 // NewXMLDriver create a new xml driver
 func NewXMLDriver() *XMLDriver {
 	return &XMLDriver{

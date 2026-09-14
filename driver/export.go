@@ -37,6 +37,37 @@ type PathParser interface {
 	AppendPath(path, name string) (newPath string)
 }
 
+// SegmentParser is an OPTIONAL PathParser extension for parsers that can
+// pre-split a path into segments in one pass.
+//
+// The engine's tree descent asks for the queried path's level and, per
+// visited node, the segment at the next level. With only GetLevel /
+// GetNameByLevel every lookup re-trims and re-splits the whole path
+// string; on a cached deep-path Get those splits were measured as ~99.9%
+// of all allocations in the read path. A caller may instead parse once
+// with ParseSegments and derive every lookup from the returned slice:
+//
+//	len(segments) == GetLevel(path)
+//	segments[n-1] == GetNameByLevel(path, n)   for 1-based n in range,
+//	                                          "" when n is out of range
+//
+// Implementations that cannot pre-split a path report ok=false, telling
+// the caller to fall back to the per-call PathParser methods.
+//
+// NOTE for composite drivers: do not embed BOTH a bundled driver type
+// (JSONDriver etc. — each forwards ParseSegments) AND a concrete parser
+// such as *DelimiterPathParser at the same depth. Both would provide
+// ParseSegments, the promoted method becomes ambiguous, and the composite
+// SILENTLY loses SegmentParser (callers fall back to per-call parsing
+// with no error). Embed either the bundled driver alone (its forwarding
+// covers any parser you inject through its PathParser field) or the
+// concrete parser plus your own Name().
+type SegmentParser interface {
+	// ParseSegments splits path into its path segments. ok is false when
+	// the parser cannot produce a segment view for this path.
+	ParseSegments(path string) (segments []string, ok bool)
+}
+
 // Realizer realize rule
 type Realizer interface {
 	// Realize realize rule

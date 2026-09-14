@@ -149,30 +149,76 @@ func (t *tree) Get(path string) ([]byte, error) {
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
-	return t.getWithParent(nil, path)
+	return t.getWithParent(nil, newPathQuery(t.driver, path))
 }
 
-// getWithParent descends towards path carrying the parent's realized
-// content. The child's inheritance decision happens atomically inside its
-// realization (see realizeWithParentCtx), not as a separate write before
-// it — that separation is what allowed the lazy+TTL race where a late
-// inheritance write clobbered a concurrently refreshed result.
-func (t *tree) getWithParent(parentContent []byte, path string) ([]byte, error) {
+// pathQuery is one query's view of the queried path. The descent asks for
+// the path's level once per visited node and the next segment once per
+// hop; asking the driver per call made it re-trim and re-split the whole
+// path string on every lookup (~99.9% of all allocations on a cached
+// deep-path Get). When the driver implements driver.SegmentParser the
+// path is split ONCE here and every lookup is a slice index; otherwise
+// the query falls back to the driver's per-call methods with identical
+// semantics.
+type pathQuery struct {
+	path   string
+	driver driver.Driver
+	segs   []string
+	parsed bool
+}
+
+// newPathQuery parses path once if the driver supports segment parsing.
+func newPathQuery(d driver.Driver, path string) pathQuery {
+	if sp, ok := d.(driver.SegmentParser); ok {
+		if segs, supported := sp.ParseSegments(path); supported {
+			return pathQuery{path: path, driver: d, segs: segs, parsed: true}
+		}
+	}
+	return pathQuery{path: path, driver: d}
+}
+
+// level returns the level of the queried path.
+func (q pathQuery) level() int {
+	if q.parsed {
+		return len(q.segs)
+	}
+	return q.driver.GetLevel(q.path)
+}
+
+// name returns the segment at the given 1-based level ("" when out of
+// range).
+func (q pathQuery) name(level int) string {
+	if q.parsed {
+		if level < 1 || level > len(q.segs) {
+			return ""
+		}
+		return q.segs[level-1]
+	}
+	return q.driver.GetNameByLevel(q.path, level)
+}
+
+// getWithParent descends towards the queried path carrying the parent's
+// realized content. The child's inheritance decision happens atomically
+// inside its realization (see realizeWithParentCtx), not as a separate
+// write before it — that separation is what allowed the lazy+TTL race
+// where a late inheritance write clobbered a concurrently refreshed
+// result.
+func (t *tree) getWithParent(parentContent []byte, q pathQuery) ([]byte, error) {
 	// Only the static prefix of the chain is realized into the cache;
 	// the dynamic layer needs request params and is skipped here.
 	if err := t.realizeWithParent(parentContent, t.staticProcs()); err != nil {
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
-	if t.driver.GetLevel(path) == t.level {
+	if q.level() == t.level {
 		return t.get(), nil
 	}
 
-	if child := t.pickChild(t.driver.GetNameByLevel(path, t.level+1)); child != nil {
+	if child := t.pickChild(q.name(t.level + 1)); child != nil {
 		if ct, ok := child.(*tree); ok {
-			return ct.getWithParent(t.get(), path)
+			return ct.getWithParent(t.get(), q)
 		}
-		return child.Get(path)
+		return child.Get(q.path)
 	}
 	return t.doFallback(nil, t.get())
 }
@@ -193,12 +239,12 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
-	return t.getContextWithParent(rc, nil, path)
+	return t.getContextWithParent(rc, nil, newPathQuery(t.driver, path))
 }
 
 // getContextWithParent is the GetWithContext descent carrying the parent's
 // realized content for atomic inheritance (see getWithParent).
-func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []byte, path string) ([]byte, error) {
+func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []byte, q pathQuery) ([]byte, error) {
 	if rc != nil {
 		rc.TreePath = t.path
 	}
@@ -207,18 +253,21 @@ func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []b
 		return nil, fmt.Errorf("realize rule on %s fail: %w", t.Path(), err)
 	}
 
-	if t.driver.GetLevel(path) == t.level {
+	if q.level() == t.level {
 		return t.dynamicRealize(rc)
 	}
 
-	if child := t.pickChild(t.driver.GetNameByLevel(path, t.level+1)); child != nil {
+	if child := t.pickChild(q.name(t.level + 1)); child != nil {
+		// one content read serves both the context leak (ParentContent)
+		// and the descent's inheritance argument
+		content := t.get()
 		if rc != nil {
-			rc.ParentContent = t.get()
+			rc.ParentContent = content
 		}
 		if ct, ok := child.(*tree); ok {
-			return ct.getContextWithParent(rc, t.get(), path)
+			return ct.getContextWithParent(rc, content, q)
 		}
-		return child.GetWithContext(rc, path)
+		return child.GetWithContext(rc, q.path)
 	}
 	return t.doFallback(rc, t.get())
 }
