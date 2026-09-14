@@ -45,6 +45,10 @@ var _ Processor = (*CombinedProcessor)(nil)
 
 // CombinedProcessor chains multiple processors into a single one.
 // Processors are applied sequentially: each one's output becomes the next one's input.
+//
+// A combined chain is param-aware whenever any inner processor is (see
+// IsParamAware); the engine keeps such chains in the per-request dynamic
+// layer instead of caching their output.
 type CombinedProcessor struct {
 	procs     []Processor
 	author    string
