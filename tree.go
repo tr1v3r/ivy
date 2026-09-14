@@ -29,6 +29,13 @@ type tree struct {
 	contentMu sync.RWMutex
 	content   []byte
 
+	// base is the pre-processor content the chain is applied to: the root
+	// template for the root node, the parent's realized content for children.
+	// Realization always starts from base — never from a previous output —
+	// so re-realization (instant mode, cache TTL expiry) cannot compound
+	// non-idempotent processors.
+	base []byte
+
 	// procs processor array
 	// only set when tree build, only concurrent reads, so no mutex needed
 	procs []driver.Processor
@@ -258,10 +265,12 @@ func (t *tree) SetDefaultContext(rc *driver.RealizeContext) {
 	}
 }
 
-// inherit set content by parent's content after check mode and realization
+// inherit set base by parent's content after check mode and realization.
+// The child's own content is produced by its realize call, starting from
+// the inherited base.
 func (t *tree) inherit(parent *tree) {
 	if t.lazyMode && t.needRealize() {
-		t.set(parent.get())
+		t.setBase(parent.get())
 	}
 }
 
@@ -359,7 +368,11 @@ func (t *tree) newSubTree(name string) Tree {
 		instantMode: t.instantMode,
 		cacheTTL:    t.cacheTTL,
 
-		level:    t.level + 1,
+		level: t.level + 1,
+		base:  t.get(),
+		// content starts as the inherited snapshot so never-realized
+		// intermediate nodes still carry the parent content down the chain
+		// (standard-mode build); realize overwrites it from base.
 		content:  t.get(),
 		children: make(map[string]Tree),
 	}
@@ -422,7 +435,9 @@ func (t *tree) realizeWithContext(rc *driver.RealizeContext, procs []driver.Proc
 		return ErrRateLimited
 	}
 
-	rule, err := t.driver.Realize(rc, t.get(), procs...)
+	// Realize from the pre-processor base, never from the node's previous
+	// output: re-realization must be idempotent for non-idempotent chains.
+	rule, err := t.driver.Realize(rc, t.getBase(), procs...)
 	if err != nil {
 		return fmt.Errorf("realize rule fail: %w", err)
 	}
@@ -443,6 +458,20 @@ func (t *tree) get() (rule []byte) {
 	t.contentMu.RLock()
 	defer t.contentMu.RUnlock()
 	return t.content
+}
+
+// setBase sets the pre-processor base content.
+func (t *tree) setBase(base []byte) {
+	t.contentMu.Lock()
+	defer t.contentMu.Unlock()
+	t.base = base
+}
+
+// getBase return the pre-processor base content.
+func (t *tree) getBase() (base []byte) {
+	t.contentMu.RLock()
+	defer t.contentMu.RUnlock()
+	return t.base
 }
 
 func (t *tree) needRealize() bool {

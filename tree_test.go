@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"golang.org/x/time/rate"
 
@@ -174,5 +175,95 @@ func TestTree_NilTreeGuards(t *testing.T) {
 	}
 	if _, err := nilTree.GetWithContext(nil, "/"); !errors.Is(err, ErrNotExistsTree) {
 		t.Errorf("expected ErrNotExistsTree from nil GetWithContext, got %v", err)
+	}
+}
+
+// appendProc returns a NON-idempotent processor: output = input + suffix.
+// It makes compounding bugs (re-applying a chain on a previous output)
+// immediately visible in the returned value.
+func appendProc(suffix string) driver.Processor {
+	return &driver.RawProcessor{Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
+		out := make([]byte, 0, len(before)+len(suffix))
+		out = append(out, before...)
+		return append(out, suffix...), nil
+	}}
+}
+
+// TestTree_InstantRootNotCompounding guards audit F1: in instant mode the
+// root node re-realizes on every access, and its chain must be replayed on
+// the root template, never on the node's previous output.
+func TestTree_InstantRootNotCompounding(t *testing.T) {
+	tree, err := NewLazyInstantTree(newTestDriver(), "instant_root", "R",
+		NewDirective("/", appendProc("-x")),
+	)
+	if err != nil {
+		t.Fatalf("build fail: %s", err)
+	}
+	for i := 0; i < 3; i++ {
+		val, err := tree.Get("/")
+		if err != nil {
+			t.Fatalf("get #%d fail: %s", i, err)
+		}
+		if string(val) != "R-x" {
+			t.Fatalf("get #%d: expect %q, got %q (instant root compounded)", i, "R-x", val)
+		}
+	}
+}
+
+// TestTree_CacheTTLRootNotCompounding guards audit F1: after the cache TTL
+// expires, the root must re-realize from the template, not compound on its
+// previous output.
+func TestTree_CacheTTLRootNotCompounding(t *testing.T) {
+	tree, err := NewLazyCacheTree(newTestDriver(), "ttl_root", "R", 40*time.Millisecond,
+		NewDirective("/", appendProc("-x")),
+	)
+	if err != nil {
+		t.Fatalf("build fail: %s", err)
+	}
+	first, err := tree.Get("/")
+	if err != nil {
+		t.Fatalf("first get fail: %s", err)
+	}
+	if string(first) != "R-x" {
+		t.Fatalf("first get: expect %q, got %q", "R-x", first)
+	}
+
+	time.Sleep(60 * time.Millisecond) // let the TTL expire
+
+	second, err := tree.Get("/")
+	if err != nil {
+		t.Fatalf("second get fail: %s", err)
+	}
+	if string(second) != "R-x" {
+		t.Fatalf("after TTL expiry: expect %q, got %q (root compounded)", "R-x", second)
+	}
+}
+
+// TestTree_CacheTTLLeafRecomposesFromParent guards the base/inherit split:
+// after TTL expiry a leaf must recompose from its parent's content exactly
+// once (its own chain applied a single time).
+func TestTree_CacheTTLLeafRecomposesFromParent(t *testing.T) {
+	tree, err := NewLazyCacheTree(newTestDriver(), "ttl_leaf", "R", 40*time.Millisecond,
+		NewDirective("/a/b", appendProc("-b")),
+	)
+	if err != nil {
+		t.Fatalf("build fail: %s", err)
+	}
+	first, err := tree.Get("/a/b")
+	if err != nil {
+		t.Fatalf("first get fail: %s", err)
+	}
+	if string(first) != "R-b" {
+		t.Fatalf("first get: expect %q, got %q", "R-b", first)
+	}
+
+	time.Sleep(60 * time.Millisecond) // let the TTL expire
+
+	second, err := tree.Get("/a/b")
+	if err != nil {
+		t.Fatalf("second get fail: %s", err)
+	}
+	if string(second) != "R-b" {
+		t.Fatalf("after TTL expiry: expect %q, got %q (leaf compounded)", "R-b", second)
 	}
 }
