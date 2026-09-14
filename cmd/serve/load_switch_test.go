@@ -55,9 +55,10 @@ func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 			t.Errorf("processor %d (%T) is nil, want loaded", i, want)
 			continue
 		}
-		if got, ok := procs[i].(driver.Processor); !ok || got == nil {
-			t.Errorf("processor %d does not implement driver.Processor", i)
-		} else if reflect.TypeOf(procs[i]) != reflect.TypeOf(want) {
+		// procs[i] is already typed driver.Processor, so a type assertion to
+		// the same interface is always true (staticcheck S1040); compare the
+		// concrete types the way the assertion's branch did before.
+		if reflect.TypeOf(procs[i]) != reflect.TypeOf(want) {
 			t.Errorf("processor %d type = %T, want %T", i, procs[i], want)
 		}
 	}
