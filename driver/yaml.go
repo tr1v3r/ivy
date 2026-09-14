@@ -1,8 +1,11 @@
 package driver
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -85,7 +88,17 @@ func (op *YAMLProcessor) Save() []byte {
 func (op *YAMLProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
 	m := make(map[string]any)
 	if len(before) > 0 {
-		if err := yaml.Unmarshal(before, &m); err != nil {
+		dec := yaml.NewDecoder(bytes.NewReader(before))
+		if err := dec.Decode(&m); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("unmarshal yaml fail: %w", err)
+		}
+		// yaml.Unmarshal-style single-shot decoding silently keeps only the
+		// first document; refuse multi-document content instead of dropping
+		// documents 2..N without a trace.
+		var extra any
+		if err := dec.Decode(&extra); err == nil {
+			return nil, fmt.Errorf("multi-document yaml content is not supported: documents beyond the first would be dropped")
+		} else if !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("unmarshal yaml fail: %w", err)
 		}
 	}
