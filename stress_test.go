@@ -8,16 +8,18 @@ package ivy
 //
 //	TestStressFourModesConcurrentGet      four modes × 64-goroutine deep-path reads
 //	TestStressForestSwapDuringGet         concurrent GetVal × Build/RefreshTree/Set swap (engine face of W2/#68)
-//	TestStressSetVsGetFunctional          concurrent Set × Get: update visible, never torn  [skipped under -race, see #47]
+//	TestStressSetVsGetFunctional          concurrent Set × Get: update visible, never torn (#47 fixed)
 //	TestStressCacheTTLExpiryStorm         TTL expiry storm: re-source exactness + thundering-herd quantification
 //	TestStressParamAwareConcurrent        param-aware dynamic layer under concurrent distinct params (H4/#67)
 //	TestStressRateLimiterDeterministic    rate limit 0/burst-1 under 64 goroutines: exactly one winner
 //	TestStressRateLimiterSwapConsistency  SetRateLimit swaps vs concurrent Gets: realize==allow invariant
+//	TestStressSetFallbackDuringGet        SetFallback swaps vs fallback-serving Gets (#47 fixed)
+//	TestStressSetDefaultContextDuringGet  SetDefaultContext swaps vs realizing Gets (#47 fixed)
+//	TestStressSetProcsSwapDuringGet       Set/apply chain swaps vs Gets (#47 fixed)
 //
-// Known-open races are exercised ONLY behind opt-in gates so the default
-// CI run (which is `go test -race ./...`) stays green:
+// The remaining known semantics gap is exercised only behind an opt-in
+// gate so the default CI run (which is `go test -race ./...`) stays green:
 //
-//	TestStressKnownRace47_*               t.Skip unless IVY_STRESS_UNFIXED=1 (issues #47)
 //	TestStressKnownRace48_ParentRefreshStaleChild   t.Skip unless IVY_STRESS_UNFIXED=1 (issue #48)
 
 import (
@@ -305,16 +307,10 @@ func TestStressForestSwapDuringGet(t *testing.T) {
 // never a torn merge, never a compounded chain, and once the writer
 // finishes, the final value must be served.
 //
-// SKIPPED UNDER -race on purpose: Set→apply swaps t.procs/t.dynamicFrom
-// without synchronization (tree.go apply), which is the known-open race
-// family of issue #47 ("同族：apply() 无锁写 t.procs/t.dynamicFrom").
-// Functional correctness is still checkable without the detector; the
-// race itself is demonstrated by TestStressKnownRace47_SetProcsSwap.
+// Since the #47 fix (Set/apply publishes the chain as one atomic
+// snapshot) this also runs under -race as a true regression guard for
+// the race itself, alongside TestStressSetProcsSwapDuringGet.
 func TestStressSetVsGetFunctional(t *testing.T) {
-	if raceDetectorOn {
-		t.Skip("known open race on t.procs/t.dynamicFrom swap in Set/apply, see #47; run without -race for the functional check")
-	}
-
 	// lazy mode with cacheTTL==0 caches forever once realized, so Set's
 	// cache invalidation (the F2 fix) is load-bearing here: without it the
 	// final Get below would keep serving the first value forever.
@@ -722,21 +718,21 @@ func TestStressRateLimiterSwapConsistency(t *testing.T) {
 	t.Logf("admitted=%d limited=%d", admitted, limited)
 }
 
-// --- known-open races and semantics gaps, opt-in only -------------------
+// --- Set-family races (#47, FIXED) and the remaining known gap (#48) ----
 //
-// These tests encode the FIXED contracts for issues #47 and #48. They FAIL
-// (or, under -race, report DATA RACE) on current master, so they are
-// skipped unless IVY_STRESS_UNFIXED=1:
+// The three #47 regression guards below used to be env-gated probes that
+// demonstrated the unsynchronized SetFallback/SetDefaultContext/Set-apply
+// writes (1038 DATA RACE warnings on a 64-goroutine load). The fix
+// publishes procs/dynamicFrom/fallback/defaultCtx atomically, so they now
+// run unconditionally — including under -race in CI.
 //
-//	IVY_STRESS_UNFIXED=1 go test -race -run 'TestStressKnownRace47' -v .
-//	    → #47 family: WARNING: DATA RACE on t.fallback / t.defaultCtx /
-//	      t.procs (tree.go SetFallback/SetDefaultContext/apply writes)
+// #48 (parent TTL refresh leaves a stale child composition) is still
+// open: its probe stays opt-in behind IVY_STRESS_UNFIXED=1 and encodes the
+// FIXED contract, so it FAILS when run manually:
+//
 //	IVY_STRESS_UNFIXED=1 go test -run 'TestStressKnownRace48' -v .
-//	    → #48: FAIL "served stale composition" (child TTL pins old parent
+//	    → FAIL "served stale composition" (child TTL pins old parent
 //	      content while the parent already re-realized)
-//
-// When the issues are fixed these gates can be removed and the tests fold
-// into the default suite.
 
 func skipUnlessUnfixedStress(t *testing.T, issue string) {
 	t.Helper()
@@ -745,12 +741,12 @@ func skipUnlessUnfixedStress(t *testing.T, issue string) {
 	}
 }
 
-// TestStressKnownRace47_SetFallback: concurrent SetFallback vs Get on a
-// missing path (fallback fires on every read) — unsynchronized t.fallback.
-func TestStressKnownRace47_SetFallback(t *testing.T) {
-	skipUnlessUnfixedStress(t, "47")
-
-	tree, err := NewLazyTree(newTestDriver(), "kr47_fb", "R",
+// TestStressSetFallbackDuringGet guards #47: SetFallback swaps the
+// fallback processor while concurrent Gets hit a missing path (fallback
+// fires on every read). The swap is atomic; every response must carry the
+// fallback marker and stay -race clean.
+func TestStressSetFallbackDuringGet(t *testing.T) {
+	tree, err := NewLazyTree(newTestDriver(), "race47_fb", "R",
 		NewDirective("/a/b", replaceProc("AB")),
 	)
 	if err != nil {
@@ -759,6 +755,8 @@ func TestStressKnownRace47_SetFallback(t *testing.T) {
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var fails failCollector
+	var anomalies int64
 	for g := 0; g < stressWorkers; g++ {
 		wg.Add(1)
 		go func() {
@@ -769,10 +767,23 @@ func TestStressKnownRace47_SetFallback(t *testing.T) {
 					return
 				default:
 				}
-				if _, err := tree.Get("/a/zzz"); err != nil {
-					t.Errorf("get fail: %s", err)
-					return
+				val, err := tree.Get("/a/zzz")
+				if err != nil {
+					fails.add("get fail: %s", err)
+					atomic.AddInt64(&anomalies, 1)
+					continue
 				}
+				// during the swap window the fallback may not be
+				// installed yet, so both the bare and the marked
+				// response are legal; anything else is corruption
+				if got := string(val); got != "R" && got != "R-fb" {
+					fails.add("fallback get = %q, want %q or %q", got, "R", "R-fb")
+					atomic.AddInt64(&anomalies, 1)
+				}
+				// pace the readers: on this fully-cached lazy tree they
+				// would otherwise spin at full speed and starve the
+				// writer's goroutine under -race (test took >13s unpaced)
+				time.Sleep(50 * time.Microsecond)
 			}
 		}()
 	}
@@ -784,14 +795,24 @@ func TestStressKnownRace47_SetFallback(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+
+	// after the last SetFallback the marker must be served
+	final, err := tree.Get("/a/zzz")
+	if err != nil {
+		t.Fatalf("final fallback get fail: %s", err)
+	}
+	if got := string(final); got != "R-fb" {
+		t.Errorf("final fallback get = %q, want %q", got, "R-fb")
+	}
+	fails.report(t, atomic.LoadInt64(&anomalies))
 }
 
-// TestStressKnownRace47_SetDefaultContext: concurrent SetDefaultContext vs
-// Get — unsynchronized t.defaultCtx read in realizeWithParentCtx.
-func TestStressKnownRace47_SetDefaultContext(t *testing.T) {
-	skipUnlessUnfixedStress(t, "47")
-
-	tree, err := NewLazyInstantTree(newTestDriver(), "kr47_ctx", "R",
+// TestStressSetDefaultContextDuringGet guards #47: SetDefaultContext
+// swaps the default RealizeContext while concurrent Gets realize through
+// it (instant mode re-realizes on every access). The swap is atomic and
+// must stay -race clean; every Get must still serve the exact content.
+func TestStressSetDefaultContextDuringGet(t *testing.T) {
+	tree, err := NewLazyInstantTree(newTestDriver(), "race47_ctx", "R",
 		NewDirective("/", replaceProc("A")),
 	)
 	if err != nil {
@@ -800,6 +821,8 @@ func TestStressKnownRace47_SetDefaultContext(t *testing.T) {
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var fails failCollector
+	var anomalies int64
 	for g := 0; g < stressWorkers; g++ {
 		wg.Add(1)
 		go func() {
@@ -810,9 +833,15 @@ func TestStressKnownRace47_SetDefaultContext(t *testing.T) {
 					return
 				default:
 				}
-				if _, err := tree.Get("/"); err != nil {
-					t.Errorf("get fail: %s", err)
-					return
+				val, err := tree.Get("/")
+				if err != nil {
+					fails.add("get fail: %s", err)
+					atomic.AddInt64(&anomalies, 1)
+					continue
+				}
+				if got := string(val); got != "A" {
+					fails.add("get = %q, want %q", got, "A")
+					atomic.AddInt64(&anomalies, 1)
 				}
 			}
 		}()
@@ -823,15 +852,16 @@ func TestStressKnownRace47_SetDefaultContext(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+	fails.report(t, atomic.LoadInt64(&anomalies))
 }
 
-// TestStressKnownRace47_SetProcsSwap: concurrent Set vs Get — unsynchronized
-// t.procs/t.dynamicFrom writes in apply() vs reads in staticProcs() (same
-// #47 family, explicitly listed in the issue body).
-func TestStressKnownRace47_SetProcsSwap(t *testing.T) {
-	skipUnlessUnfixedStress(t, "47")
-
-	tree, err := NewLazyInstantTree(newTestDriver(), "kr47_procs", "R",
+// TestStressSetProcsSwapDuringGet guards #47: Set→apply replaces the
+// processor chain while concurrent Gets read it. The (procs, dynamicFrom)
+// pair is published as one atomic snapshot, so readers never observe a
+// torn chain and the swap must stay -race clean; every response must be
+// one of the two exact full values.
+func TestStressSetProcsSwapDuringGet(t *testing.T) {
+	tree, err := NewLazyInstantTree(newTestDriver(), "race47_procs", "R",
 		NewDirective("/", replaceProc("A")),
 	)
 	if err != nil {
@@ -840,6 +870,8 @@ func TestStressKnownRace47_SetProcsSwap(t *testing.T) {
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var fails failCollector
+	var anomalies int64
 	for g := 0; g < stressWorkers; g++ {
 		wg.Add(1)
 		go func() {
@@ -850,9 +882,15 @@ func TestStressKnownRace47_SetProcsSwap(t *testing.T) {
 					return
 				default:
 				}
-				if _, err := tree.Get("/"); err != nil {
-					t.Errorf("get fail: %s", err)
-					return
+				val, err := tree.Get("/")
+				if err != nil {
+					fails.add("get fail: %s", err)
+					atomic.AddInt64(&anomalies, 1)
+					continue
+				}
+				if got := string(val); got != "A" && got != "B" {
+					fails.add("torn get = %q, want %q or %q", got, "A", "B")
+					atomic.AddInt64(&anomalies, 1)
 				}
 			}
 		}()
@@ -869,6 +907,7 @@ func TestStressKnownRace47_SetProcsSwap(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+	fails.report(t, atomic.LoadInt64(&anomalies))
 }
 
 // TestStressKnownRace48_ParentRefreshStaleChild encodes the FIXED contract
