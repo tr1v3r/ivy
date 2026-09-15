@@ -124,14 +124,14 @@ type RuleDataItem struct {
 //     (SIGHUP reload) — load never silently yields an empty tree;
 //   - processor-level failures degrade per-op: a processor whose Load
 //     fails (e.g. a value of the wrong type) is dropped with an error
-//     naming the rule and op index. A half-unmarshaled zero-value
+//     naming the rule and op index, and so is an op of unknown type
+//     (#60/W7 — a typo like "Json" used to become a nil slot that
+//     StdRealizer silently skipped). A half-unmarshaled or unknown
 //     processor must never enter a chain, where it would silently emit
-//     invalid content;
-//   - a directive whose processors all failed to Load is dropped
-//     entirely (an explicitly empty "Processors": [] stays as-is).
-//
-// Unknown processor types keep their current nil slot; that silent
-// no-op is W7's (#60) scope.
+//     invalid content or no-op;
+//   - a directive whose processors were all dropped (Load failures or
+//     unknown types) is dropped entirely (an explicitly empty
+//     "Processors": [] stays as-is).
 func load() ([]ivy.Directive, error) {
 	var filename = os.Getenv("RULES_FILE")
 	if filename == "" {
@@ -164,10 +164,13 @@ func load() ([]ivy.Directive, error) {
 				op = new(driver.TOMLProcessor)
 			case "template":
 				op = new(driver.TemplateProcessor)
-			}
-			if op == nil {
-				// unknown type: nil slot, see W7 (#60)
-				ops = append(ops, op)
+			default:
+				// unknown type (#60/W7): a typo like "Json" used to append a
+				// nil processor that StdRealizer silently skipped
+				// (driver/common.go) — the rule became a no-op with no
+				// warning. Drop the op with an error naming the rule and op
+				// index instead.
+				log.Errorf("rules %q op %d: unknown processor type %q, op dropped", line.Path, i, opData.Type)
 				continue
 			}
 			if err := op.Load(opData.Data); err != nil {
@@ -178,7 +181,7 @@ func load() ([]ivy.Directive, error) {
 			ops = append(ops, op)
 		}
 		if len(ops) == 0 && len(line.Processors) > 0 {
-			log.Errorf("rules %q: every processor failed to Load, directive dropped", line.Path)
+			log.Errorf("rules %q: no processor could be loaded (all failed to Load or had unknown type), directive dropped", line.Path)
 			continue
 		}
 		directives = append(directives, ivy.NewDirective(line.Path, ops...))

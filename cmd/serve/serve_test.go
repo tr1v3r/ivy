@@ -57,11 +57,14 @@ func TestLoad(t *testing.T) {
 		t.Errorf("unexpected path: %s", directives[0].Path())
 	}
 	procs := directives[0].Processors()
-	if len(procs) != 3 {
-		t.Fatalf("expect 3 processors, got %d", len(procs))
+	// the unknown-type op is dropped (#60/W7), the two curl ops stay
+	if len(procs) != 2 {
+		t.Fatalf("expect 2 processors (unknown type dropped), got %d", len(procs))
 	}
-	if procs[0] == nil {
-		t.Fatal("curl processor should be loaded")
+	for i, p := range procs {
+		if p == nil {
+			t.Errorf("processor %d must not be nil", i)
+		}
 	}
 	if procs[0].Type() != "curl" {
 		t.Errorf("unexpected processor type: %s", procs[0].Type())
