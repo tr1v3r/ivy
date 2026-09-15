@@ -6,16 +6,18 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/tr1v3r/ivy"
 	"github.com/tr1v3r/ivy/driver"
 )
 
 // load() processor-type switch: every known type must map to the right
-// Processor implementation, unknown types yield a nil processor, and a
-// Load failure is warned but does not abort the directive.
+// Processor implementation, unknown types yield a nil processor slot
+// (W7/#60 scope), and a Load failure drops the op (#58/W5) — a
+// half-unmarshaled zero-value processor never enters the chain.
 func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 	rules := `[
 		{"path":"/all","Processors":[
-			{"type":"json","data":{"path":"a","type":"create","value":1}},
+			{"type":"json","data":{"path":"a","type":"create","value":"MQ=="}},
 			{"type":"yaml","data":{"path":"a","type":"create","yaml_path":"a"}},
 			{"type":"curl","data":{"url":"http://localhost:1/ping"}},
 			{"type":"xml","data":{"path":"a","type":"create","xml_path":"root/a"}},
@@ -35,9 +37,13 @@ func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 	}
 	t.Setenv("RULES_FILE", file)
 
-	directives := load()
-	if len(directives) != 3 {
-		t.Fatalf("expect 3 directives, got %d", len(directives))
+	directives, err := load()
+	if err != nil {
+		t.Fatalf("load fail: %s", err)
+	}
+	// /bad is dropped: its only op failed to Load (#58/W5)
+	if len(directives) != 2 {
+		t.Fatalf("expect 2 directives (/bad dropped), got %d", len(directives))
 	}
 
 	// the per-format processors' Type() returns their operation type
@@ -63,17 +69,15 @@ func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 		}
 	}
 
-	// bad data for a known type: Load fails (warned) but op is still appended
-	bad := directives[1].Processors()
-	if len(bad) != 1 {
-		t.Fatalf("expect 1 processor on /bad, got %d", len(bad))
-	}
-	if bad[0] == nil {
-		t.Fatal("processor for known type should be constructed even when Load fails")
+	// /bad: the only op failed to Load (data 42 does not unmarshal into
+	// a processor), so the op is dropped and the directive with it — a
+	// zero-value processor must never enter a chain (#58/W5)
+	if directives[1].Path() != "/unknown" {
+		t.Errorf("expected /bad to be dropped, directives are %s", directivePaths(directives))
 	}
 
 	// unknown type: op stays nil but keeps its slot
-	unknown := directives[2].Processors()
+	unknown := directives[1].Processors()
 	if len(unknown) != 1 {
 		t.Fatalf("expect 1 processor on /unknown, got %d", len(unknown))
 	}
@@ -82,12 +86,30 @@ func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 	}
 }
 
+func directivePaths(directives []ivy.Directive) string {
+	paths := ""
+	for i, d := range directives {
+		if i > 0 {
+			paths += ", "
+		}
+		paths += d.Path()
+	}
+	return "[" + paths + "]"
+}
+
 // default filename branch: unset RULES_FILE falls back to defaultFilename.
 func TestLoad_DefaultFilenameFallback(t *testing.T) {
 	t.Setenv("RULES_FILE", "")
-	directives := load()
-	// the default file ships with the repo; loading it must not panic and
-	// must return whatever it contains (possibly nil if cwd differs)
+	// go test runs with CWD=cmd/serve, so the default resolves to the
+	// repo's shipped conf/rules.json (from any other CWD load now
+	// returns an explicit error instead of a silent empty tree)
+	directives, err := load()
+	if err != nil {
+		t.Fatalf("default rules file must load, got: %s", err)
+	}
+	if len(directives) == 0 {
+		t.Fatal("shipped conf/rules.json must yield directives")
+	}
 	for _, d := range directives {
 		if d == nil {
 			t.Fatal("directive is nil")

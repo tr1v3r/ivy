@@ -22,7 +22,10 @@ func TestLoad_DefaultRulesFile(t *testing.T) {
 	}
 
 	t.Setenv("RULES_FILE", defaultRules)
-	directives := load()
+	directives, err := load()
+	if err != nil {
+		t.Fatalf("default rules file must load: %s", err)
+	}
 	if len(directives) == 0 {
 		t.Fatal("default conf/rules.json must load at least one directive — " +
 			"check for json key drift against RuleDataItem tags (e.g. \"operators\" vs \"Processors\")")

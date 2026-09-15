@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +46,10 @@ func TestLoad(t *testing.T) {
 	}
 
 	t.Setenv("RULES_FILE", file)
-	directives := load()
+	directives, err := load()
+	if err != nil {
+		t.Fatalf("load fail: %s", err)
+	}
 	if len(directives) != 1 {
 		t.Fatalf("expect 1 directive, got %d", len(directives))
 	}
@@ -65,9 +69,16 @@ func TestLoad(t *testing.T) {
 }
 
 func TestLoad_DefaultFileMissing(t *testing.T) {
-	// no RULES_FILE set: falls back to a path that does not exist for tests
+	// #58/W5: a missing rules file is an error, never a silent empty tree
 	t.Setenv("RULES_FILE", "/nonexistent/rules.json")
-	if directives := load(); directives != nil {
+	directives, err := load()
+	if err == nil {
+		t.Fatal("expected error on missing rules file, got nil")
+	}
+	if !strings.Contains(err.Error(), "/nonexistent/rules.json") {
+		t.Errorf("error should name the rules file, got: %s", err)
+	}
+	if directives != nil {
 		t.Errorf("expected nil directives on missing file, got %d", len(directives))
 	}
 }
@@ -80,7 +91,11 @@ func TestLoad_InvalidJSON(t *testing.T) {
 	}
 
 	t.Setenv("RULES_FILE", file)
-	if directives := load(); directives != nil {
+	directives, err := load()
+	if err == nil {
+		t.Fatal("expected error on invalid json, got nil")
+	}
+	if directives != nil {
 		t.Errorf("expected nil directives on invalid json, got %d", len(directives))
 	}
 }
