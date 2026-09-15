@@ -2,6 +2,7 @@ package driver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,15 +117,29 @@ func (op *CURLProcessor) Save() []byte {
 }
 
 // Process performs the HTTP request; non-2xx responses yield a *CURLProcessError with full diagnostics.
-func (op *CURLProcessor) Process(_ *RealizeContext, _ []byte) ([]byte, error) {
+//
+// The context carried by rc (when present) is propagated to the outbound
+// request: a canceled RealizeContext aborts the upstream call promptly with
+// a *CURLProcessError wrapping context.Canceled, instead of occupying the
+// upstream connection until the fetch client's fallback timeout. A missing
+// rc or embedded context falls back to context.Background().
+func (op *CURLProcessor) Process(rc *RealizeContext, _ []byte) ([]byte, error) {
 	method := strings.ToUpper(strings.TrimSpace(op.Method))
 	if method == "" {
 		method = "GET"
 	}
 
+	ctx := context.Background()
+	if rc != nil && rc.Context != nil {
+		ctx = rc.Context
+	}
+
 	startedAt := time.Now()
+	// fetch.DoRequestWithContext exists but drops the response headers the
+	// diagnostics below need, so the context travels as an explicit
+	// RequestOption on the full 4-value call.
 	statusCode, content, responseHeader, err := fetch.DoRequestWithOptions(method, op.URL,
-		[]fetch.RequestOption{fetch.WithHeaders(op.Header)}, bytes.NewReader(op.Body))
+		[]fetch.RequestOption{fetch.WithContext(ctx), fetch.WithHeaders(op.Header)}, bytes.NewReader(op.Body))
 	duration := time.Since(startedAt)
 	if err != nil {
 		return nil, &CURLProcessError{
