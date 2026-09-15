@@ -31,7 +31,8 @@ func (d *DelimiterPathParser) GetLevel(path string) int {
 	return 0
 }
 
-// GetNameByLevel returns the segment at the given 1-based level, or "" when out of range.
+// GetNameByLevel returns the segment at the given 1-based level, or "" when
+// the level is out of range — including level <= 0, which never panics.
 func (d *DelimiterPathParser) GetNameByLevel(path string, level int) string {
 	if path = strings.Trim(strings.TrimSpace(path), d.delimiter); path != "" {
 		return d.getName(strings.Split(path, d.delimiter), level-1)
@@ -60,7 +61,10 @@ func (d *DelimiterPathParser) ParseSegments(path string) ([]string, bool) {
 // AppendPath joins a name onto a path with the parser delimiter.
 func (d *DelimiterPathParser) AppendPath(path, name string) string { return path + d.delimiter + name }
 func (d *DelimiterPathParser) getName(paths []string, index int) string {
-	if index >= len(paths) {
+	// Levels are 1-based, so a non-positive level arrives here as a
+	// negative index; treat it like any other out-of-range lookup
+	// instead of panicking on paths[index].
+	if index < 0 || index >= len(paths) {
 		return ""
 	}
 	return paths[index]
