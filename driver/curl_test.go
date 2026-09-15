@@ -1,9 +1,9 @@
 package driver_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,43 +14,24 @@ import (
 	"github.com/tr1v3r/pkg/fetch"
 )
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return f(request)
-}
-
-func useHTTPClient(t *testing.T, transport roundTripperFunc) {
-	t.Helper()
-	previous := fetch.DefaultClient()
-	fetch.SetDefaultClient(&http.Client{Transport: transport})
-	t.Cleanup(func() {
-		fetch.SetDefaultClient(previous)
-	})
-}
-
 func TestCURLProcessorReportsHTTPFailureDetails(t *testing.T) {
 	const (
 		responseBody = `{"error":"invalid payload","field":"name"}`
 		secretToken  = "secret-bearer-token"
 		sessionID    = "secret-session-id"
 	)
-	useHTTPClient(t, func(request *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusUnprocessableEntity,
-			Header: http.Header{
-				"Content-Type": {"application/json"},
-				"Set-Cookie":   {"session=" + sessionID},
-				"X-Request-Id": {"req-123"},
-			},
-			Body:    io.NopCloser(strings.NewReader(responseBody)),
-			Request: request,
-		}, nil
-	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Add("Set-Cookie", "session="+sessionID)
+		w.Header().Set("X-Request-Id", "req-123")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(responseBody))
+	}))
+	defer srv.Close()
 
 	op := &driver.CURLProcessor{
 		Method: "post",
-		URL:    "https://example.test/users?access_token=query-secret&view=summary",
+		URL:    srv.URL + "/users?access_token=query-secret&view=summary",
 		Body:   []byte(`{"name":""}`),
 		Header: map[string][]string{
 			"Authorization": {"Bearer " + secretToken},
@@ -138,13 +119,10 @@ func TestCURLProcessorReportsRequestConstructionFailure(t *testing.T) {
 }
 
 func TestCURLProcessorRedactsURLInTransportFailure(t *testing.T) {
-	useHTTPClient(t, func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("connection refused")
-	})
-
+	// port 1 on loopback is never listening: deterministic connection refused
 	const secret = "query-secret"
 	op := &driver.CURLProcessor{
-		URL: "https://example.test/users?access_token=" + secret,
+		URL: "https://127.0.0.1:1/users?access_token=" + secret,
 	}
 	_, err := op.Process(nil, nil)
 	if err == nil {
@@ -159,16 +137,12 @@ func TestCURLProcessorRedactsURLInTransportFailure(t *testing.T) {
 }
 
 func TestCURLProcessorKeepsSuccessfulResponse(t *testing.T) {
-	useHTTPClient(t, func(request *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("ok")),
-			Request:    request,
-		}, nil
-	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
 
-	content, err := (&driver.CURLProcessor{URL: "https://example.test"}).Process(nil, nil)
+	content, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
 	if err != nil {
 		t.Fatalf("Process() error = %v, want nil", err)
 	}
@@ -222,28 +196,150 @@ func TestCURLProcessorHonorsRealizeContextCancellation(t *testing.T) {
 // safe: a RealizeContext without an embedded Context (or no rc at all) must
 // still perform a normal, uncanceled request.
 func TestCURLProcessorWithoutRealizeContextContext(t *testing.T) {
-	useHTTPClient(t, func(request *http.Request) (*http.Response, error) {
-		if request.Context() == nil {
-			t.Error("outbound request carries no context")
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("ok")),
-			Request:    request,
-		}, nil
-	})
+	// Rewritten for the ivy-owned curl clients (issue #52): no fake-transport
+	// hook exists anymore, so the nil-context corner runs against a real
+	// loopback server. A RealizeContext without an embedded Context (or no
+	// rc at all) must fall back to an uncanceled request and succeed.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
 
 	for name, rc := range map[string]*driver.RealizeContext{
 		"nil rc":              nil,
 		"rc without embedded": {},
 	} {
-		content, err := (&driver.CURLProcessor{URL: "https://example.test"}).Process(rc, nil)
+		content, err := (&driver.CURLProcessor{URL: srv.URL}).Process(rc, nil)
 		if err != nil {
 			t.Fatalf("%s: Process() error = %v, want nil", name, err)
 		}
 		if got := string(content); got != "ok" {
 			t.Errorf("%s: Process() content = %q, want %q", name, got, "ok")
 		}
+	}
+}
+
+// ---- security posture (issue #52, M2) ----
+
+func TestCURLProcessorRejectsSelfSignedTLSByDefault(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("tls-ok"))
+	}))
+	defer srv.Close()
+
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
+	if err == nil {
+		t.Fatal("Process() error = nil, want TLS verification failure against a self-signed certificate")
+	}
+	var processErr *driver.CURLProcessError
+	if !errors.As(err, &processErr) {
+		t.Fatalf("Process() error type = %T, want *driver.CURLProcessError", err)
+	}
+	if !strings.Contains(err.Error(), "x509") && !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("expected certificate verification error, got: %s", err)
+	}
+}
+
+// The TLS posture of curl rules must not depend on fetch's process-global
+// default client: any library in-process can call
+// fetch.SetDefaultClient(fetch.NewInsecureClient()) and would otherwise
+// silently disable certificate verification for every curl rule.
+func TestCURLProcessorTLSPostureIndependentOfFetchDefaultClient(t *testing.T) {
+	previous := fetch.DefaultClient()
+	fetch.SetDefaultClient(fetch.NewInsecureClient())
+	t.Cleanup(func() { fetch.SetDefaultClient(previous) })
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("tls-ok"))
+	}))
+	defer srv.Close()
+
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
+	if err == nil {
+		t.Fatal("Process() error = nil despite fetch.DefaultClient being swapped for an insecure client; the curl TLS posture must be owned by ivy, not the fetch global")
+	}
+}
+
+func TestCURLProcessorEnforcesDefaultResponseBodyLimit(t *testing.T) {
+	// one byte past the 10 MiB package default
+	oversized := bytes.Repeat([]byte("a"), (10<<20)+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(oversized)
+	}))
+	defer srv.Close()
+
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
+	if err == nil {
+		t.Fatal("Process() error = nil, want an explicit limit-exceeded error for a response past the default cap")
+	}
+	if !strings.Contains(err.Error(), "max_bytes") {
+		t.Errorf("error should name the max_bytes limit, got: %s", err)
+	}
+}
+
+func TestCURLProcessorAllowlistRejectsNonAllowedHost(t *testing.T) {
+	t.Setenv("IVY_CURL_ALLOW_HOSTS", "example.internal, allowed.example ")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("leak"))
+	}))
+	defer srv.Close()
+
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil) // 127.0.0.1 is not allowlisted
+	if err == nil {
+		t.Fatal("Process() error = nil, want allowlist rejection for a host absent from IVY_CURL_ALLOW_HOSTS")
+	}
+	if !strings.Contains(err.Error(), "IVY_CURL_ALLOW_HOSTS") {
+		t.Errorf("error should name the allowlist, got: %s", err)
+	}
+}
+
+func TestCURLProcessorAllowlistAdmitsListedHost(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	t.Setenv("IVY_CURL_ALLOW_HOSTS", "example.internal,127.0.0.1")
+	content, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
+	if err != nil {
+		t.Fatalf("Process() error = %v, want nil for an allowlisted host", err)
+	}
+	if got := string(content); got != "ok" {
+		t.Errorf("Process() content = %q, want %q", got, "ok")
+	}
+}
+
+// A redirect from an allowed host to a non-allowed host must not bypass the
+// allowlist (classic SSRF pivot through 302).
+func TestCURLProcessorAllowlistBlocksRedirectToNonAllowedHost(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("internal"))
+	}))
+	defer target.Close()
+	targetAddr := strings.TrimPrefix(target.URL, "http://127.0.0.1") // :port
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://localhost"+targetAddr, http.StatusFound)
+	}))
+	defer srv.Close()
+
+	t.Setenv("IVY_CURL_ALLOW_HOSTS", "127.0.0.1") // entry host allowed, "localhost" is not
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
+	if err == nil {
+		t.Fatal("Process() error = nil, want allowlist rejection for a redirect to a non-allowed host")
+	}
+	if !strings.Contains(err.Error(), "IVY_CURL_ALLOW_HOSTS") {
+		t.Errorf("error should name the allowlist, got: %s", err)
+	}
+}
+
+func TestCURLProcessorRejectsNonHTTPScheme(t *testing.T) {
+	op := &driver.CURLProcessor{URL: "file:///etc/passwd"}
+	_, err := op.Process(nil, nil)
+	if err == nil {
+		t.Fatal("Process() error = nil, want scheme rejection for a non-http(s) URL")
+	}
+	if !strings.Contains(err.Error(), "scheme") {
+		t.Errorf("error should mention the scheme, got: %s", err)
 	}
 }

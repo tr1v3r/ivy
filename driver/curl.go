@@ -3,17 +3,19 @@ package driver
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/tr1v3r/pkg/fetch"
 )
 
 var _ Processor = (*CURLProcessor)(nil)
@@ -25,6 +27,57 @@ const (
 	maxCURLBodyDetailBytes   = 4 * 1024
 	redactedValue            = "[REDACTED]"
 )
+
+// curl security posture (issue #52, M2).
+const (
+	// defaultCURLMaxResponseBodyBytes caps response bodies when a processor
+	// does not set MaxBytes, so a malicious upstream cannot exhaust memory
+	// with an unbounded response.
+	defaultCURLMaxResponseBodyBytes = 10 << 20 // 10 MiB
+	// curlAllowHostsEnv names the process-level upstream hostname
+	// allowlist: a comma-separated list of hostnames. Unset or empty allows
+	// every host (out-of-box default); otherwise a curl URL — and every
+	// redirect target — must match one entry exactly (case-insensitive,
+	// ports are ignored).
+	curlAllowHostsEnv = "IVY_CURL_ALLOW_HOSTS"
+	// curlRequestTimeout is the fallback request timeout, preserving the
+	// historical fetch-client behavior for callers that provide no
+	// cancellation signal of their own.
+	curlRequestTimeout = 60 * time.Second
+	// curlMaxRedirects mirrors net/http's default redirect limit.
+	curlMaxRedirects = 10
+)
+
+// ivy owns the curl HTTP clients instead of reusing fetch.DefaultClient:
+// the TLS posture of every rule must not hinge on a process-global mutable
+// default — any library calling fetch.SetDefaultClient would otherwise
+// decide (or silently disable) certificate verification for ivy rules.
+var (
+	curlVerifyingClient = newCURLClient(&tls.Config{MinVersion: tls.VersionTLS12})
+	curlInsecureClient  = newCURLClient(&tls.Config{InsecureSkipVerify: true}) //nolint:gosec // explicit per-rule opt-in via "insecure": true
+)
+
+// newCURLClient builds one of ivy's curl clients over a cloned default
+// transport (standard pooling, ProxyFromEnvironment). Redirect targets are
+// revalidated against the same host allowlist as the initial URL, so a 302
+// from an allowed host to an internal address cannot bypass it.
+func newCURLClient(tlsConfig *tls.Config) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	return &http.Client{
+		Timeout:   curlRequestTimeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= curlMaxRedirects {
+				return fmt.Errorf("curl: stopped after %d redirects", curlMaxRedirects)
+			}
+			if !curlHostAllowed(req.URL.Hostname()) {
+				return fmt.Errorf("curl: redirect to host %q blocked by the %s allowlist", req.URL.Hostname(), curlAllowHostsEnv)
+			}
+			return nil
+		},
+	}
+}
 
 // CURLProcessError contains the request and response details needed to diagnose
 // a failed CURLProcessor request. Sensitive header and URL values are redacted
@@ -84,6 +137,18 @@ type CURLProcessor struct {
 	Body   []byte              `json:"body,omitempty"`
 	Header map[string][]string `json:"header,omitempty"`
 
+	// Insecure skips TLS certificate verification for this processor's
+	// upstream, e.g. self-signed certificates. Default false: certificates
+	// are verified (MITM protection). Opt in per rule, for trusted networks
+	// only.
+	Insecure bool `json:"insecure,omitempty"`
+
+	// MaxBytes caps the accepted response body size in bytes. 0 applies the
+	// package default (10 MiB); a positive value sets the cap; a negative
+	// value disables it. Oversized bodies yield a *CURLProcessError naming
+	// max_bytes instead of exhausting process memory.
+	MaxBytes int64 `json:"max_bytes,omitempty"`
+
 	// A is the author of the Processor
 	A string `json:"author"`
 	// C is the create time of the Processor
@@ -123,6 +188,12 @@ func (op *CURLProcessor) Save() []byte {
 // a *CURLProcessError wrapping context.Canceled, instead of occupying the
 // upstream connection until the fetch client's fallback timeout. A missing
 // rc or embedded context falls back to context.Background().
+//
+// Security posture: TLS certificates are verified unless the processor opts
+// in via Insecure; response bodies above MaxBytes (default 10 MiB) fail with
+// an explicit error; and both the URL and any redirect target must pass the
+// IVY_CURL_ALLOW_HOSTS allowlist when it is set (empty allows all hosts),
+// with the URL scheme restricted to http/https.
 func (op *CURLProcessor) Process(rc *RealizeContext, _ []byte) ([]byte, error) {
 	method := strings.ToUpper(strings.TrimSpace(op.Method))
 	if method == "" {
@@ -135,11 +206,10 @@ func (op *CURLProcessor) Process(rc *RealizeContext, _ []byte) ([]byte, error) {
 	}
 
 	startedAt := time.Now()
-	// fetch.DoRequestWithContext exists but drops the response headers the
-	// diagnostics below need, so the context travels as an explicit
-	// RequestOption on the full 4-value call.
-	statusCode, content, responseHeader, err := fetch.DoRequestWithOptions(method, op.URL,
-		[]fetch.RequestOption{fetch.WithContext(ctx), fetch.WithHeaders(op.Header)}, bytes.NewReader(op.Body))
+	// The caller's context travels on the native request so cancellation
+	// aborts the upstream call while preserving the 4-value diagnostics
+	// (the fetch helper that drops response headers is no longer used).
+	statusCode, content, responseHeader, err := op.doRequest(ctx, method)
 	duration := time.Since(startedAt)
 	if err != nil {
 		return nil, &CURLProcessError{
@@ -147,6 +217,8 @@ func (op *CURLProcessor) Process(rc *RealizeContext, _ []byte) ([]byte, error) {
 			URL:             op.URL,
 			RequestHeader:   cloneHTTPHeader(op.Header),
 			RequestBodySize: len(op.Body),
+			StatusCode:      statusCode,
+			ResponseHeader:  responseHeader.Clone(),
 			Duration:        duration,
 			Err:             err,
 		}
@@ -164,6 +236,102 @@ func (op *CURLProcessor) Process(rc *RealizeContext, _ []byte) ([]byte, error) {
 		}
 	}
 	return content, nil
+}
+
+// doRequest performs the outbound request with ivy's own clients and
+// applies the URL scheme/allowlist pre-checks and the response body cap.
+// ctx is threaded into the request so caller cancellation aborts the
+// upstream call promptly; the clients' own timeout remains the fallback
+// for contexts without a deadline.
+func (op *CURLProcessor) doRequest(ctx context.Context, method string) (statusCode int, content []byte, responseHeader http.Header, err error) {
+	if err := op.checkURL(); err != nil {
+		return 0, nil, nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, op.URL, bytes.NewReader(op.Body))
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("build new request fail: %w", err)
+	}
+	for key, values := range op.Header {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+
+	client := curlVerifyingClient
+	if op.Insecure {
+		client = curlInsecureClient
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return -1, nil, nil, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	limit := op.maxResponseBodyBytes()
+	var reader io.Reader = resp.Body
+	if limit >= 0 && limit < math.MaxInt64 {
+		// read one byte past the cap so overflow is detectable
+		reader = io.LimitReader(resp.Body, limit+1)
+	}
+	content, err = io.ReadAll(reader)
+	if err != nil {
+		return -1, nil, nil, err
+	}
+	if limit >= 0 && int64(len(content)) > limit {
+		return resp.StatusCode, nil, resp.Header, fmt.Errorf(
+			"response body exceeds the curl max_bytes limit: got at least %d bytes, limit is %d (raise max_bytes on the curl processor, or set it to -1 to disable the cap)",
+			int64(len(content)), limit)
+	}
+	return resp.StatusCode, content, resp.Header, nil
+}
+
+// checkURL enforces the curl URL scheme and host allowlist before any
+// connection is attempted.
+func (op *CURLProcessor) checkURL() error {
+	parsed, err := url.Parse(op.URL)
+	if err != nil {
+		return fmt.Errorf("build new request fail: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("curl url scheme %q is not allowed, want http or https", parsed.Scheme)
+	}
+	if !curlHostAllowed(parsed.Hostname()) {
+		return fmt.Errorf("curl upstream host %q is not allowed by the %s allowlist", parsed.Hostname(), curlAllowHostsEnv)
+	}
+	return nil
+}
+
+// maxResponseBodyBytes resolves the effective response body cap: a positive
+// MaxBytes sets it, zero selects the package default, negative disables it.
+func (op *CURLProcessor) maxResponseBodyBytes() int64 {
+	switch {
+	case op.MaxBytes < 0:
+		return -1
+	case op.MaxBytes == 0:
+		return defaultCURLMaxResponseBodyBytes
+	default:
+		return op.MaxBytes
+	}
+}
+
+// curlHostAllowed reports whether host passes the IVY_CURL_ALLOW_HOSTS
+// allowlist. An unset or empty allowlist allows every host; otherwise the
+// hostname must equal one comma-separated entry (case-insensitive, ports
+// ignored).
+func curlHostAllowed(host string) bool {
+	allowlist := os.Getenv(curlAllowHostsEnv)
+	if strings.TrimSpace(allowlist) == "" {
+		return true
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	for _, entry := range strings.Split(allowlist, ",") {
+		if strings.ToLower(strings.TrimSpace(entry)) == host {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneHTTPHeader(header map[string][]string) http.Header {
