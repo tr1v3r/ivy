@@ -240,7 +240,9 @@ func TestRealizeWithContext_Dispatch(t *testing.T) {
 
 	proc := &driver.RawProcessor{
 		Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
-			return append(before, []byte("_ctx")...), nil
+			// keep the document valid JSON for the JSONProcessor
+			// below (a non-JSON base is now an explicit error, #57)
+			return append(before[:len(before)-1], []byte(`"ctx":true}`)...), nil
 		},
 	}
 

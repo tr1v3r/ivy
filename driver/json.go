@@ -1,10 +1,12 @@
 package driver
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -94,6 +96,18 @@ func (op *JSONProcessor) Save() []byte {
 
 // Process applies the typed operation to the JSON content via sjson.
 func (op *JSONProcessor) Process(_ *RealizeContext, before []byte) (after []byte, err error) {
+	// sjson silently rebuilds a non-JSON base into {"k":"v"}, throwing
+	// the original content away — e.g. a curl processor earlier in the
+	// chain returning HTML. Reject such bases for the mutating types
+	// (#57); delete passes non-JSON through untouched, and an empty (or
+	// whitespace-only) base legitimately initializes a fresh document.
+	switch op.T {
+	case "create", "append", "replace", "set":
+		if trimmed := bytes.TrimSpace(before); len(trimmed) > 0 && !gjson.ValidBytes(trimmed) {
+			return nil, fmt.Errorf("json processor %s on %s: base content is not valid JSON", op.T, op.JSONPath)
+		}
+	}
+
 	switch op.T {
 	case "create", "append", "replace":
 		return sjson.SetBytes(before, op.JSONPath, op.V)
