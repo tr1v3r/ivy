@@ -33,7 +33,7 @@ func (m *GeneralModem[T]) Unmarshal(data []byte) ([]Processor, error) {
 
 	typ, err := m.checkType()
 	if err != nil {
-		return nil, fmt.Errorf("invalid type T %s: %w", typ.Name(), err)
+		return nil, fmt.Errorf("invalid type T %s: %w", reflect.TypeFor[T](), err)
 	}
 
 	var ops = make([]Processor, 0, len(buf))
@@ -47,15 +47,25 @@ func (m *GeneralModem[T]) Unmarshal(data []byte) ([]Processor, error) {
 	return ops, nil
 }
 
+// checkType validates that Unmarshal's reflect-based instantiation can
+// work for T and returns the struct type instances are built from:
+// T must be a pointer to a concrete type.
 func (m *GeneralModem[T]) checkType() (reflect.Type, error) {
 	var t T
 	typ := reflect.TypeOf(t)
 
-	if typ.Kind() == reflect.Interface {
-		return nil, errors.New("cannot be Interface")
+	switch {
+	case typ == nil:
+		// T is an interface type: its zero value carries no dynamic
+		// type, so there is nothing to reflect.New an instance from.
+		// (reflect.TypeOf of a nil interface returns nil — asking it
+		// for a Kind would itself panic.)
+		return nil, errors.New("type parameter T must be concrete, not an interface")
+	case typ.Kind() != reflect.Pointer:
+		// reflect.New always yields *T; asserting that back to a
+		// value-type T can never succeed (interface conversion
+		// panic), so reject the shape up front.
+		return nil, errors.New("type parameter T must be a pointer type")
 	}
-	if typ.Kind() == reflect.Pointer {
-		typ = typ.Elem()
-	}
-	return typ, nil
+	return typ.Elem(), nil
 }
