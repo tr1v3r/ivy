@@ -105,7 +105,33 @@ func register(r *gin.Engine) *gin.Engine {
 	return r
 }
 
-var defaultFilename = "../../conf/rules.json"
+// defaultRulesCandidates lists the rules-file locations probed, in
+// order, when RULES_FILE is unset (#59): the documented
+// `go run ./cmd/serve` starts with CWD at the repo root
+// ("conf/rules.json"), while `go test ./cmd/serve` and deployments
+// launched from cmd/serve resolve the legacy "../../conf/rules.json"
+// two levels up.
+var defaultRulesCandidates = []string{
+	"conf/rules.json",
+	"../../conf/rules.json",
+}
+
+// rulesFilename resolves the rules file to load: an explicit RULES_FILE
+// wins verbatim (user intent is never probed away); otherwise the first
+// existing default candidate is used. When none exists the primary
+// candidate is returned so the read error names it — fail-loud on a
+// missing default is #58's (W5) job.
+func rulesFilename() string {
+	if filename := os.Getenv("RULES_FILE"); filename != "" {
+		return filename
+	}
+	for _, candidate := range defaultRulesCandidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return defaultRulesCandidates[0]
+}
 
 // RuleDataItem is one entry of the rules file: the tree path the
 // directive applies to and the serialized processors to run there.
@@ -117,8 +143,13 @@ type RuleDataItem struct {
 	} `json:"Processors"`
 }
 
-// load reads the rules file and builds directives (#58/W5):
+// load reads the rules file and builds directives (#58/W5, #59/W6):
 //
+//   - the rules file is resolved by rulesFilename() (#59/W6): an explicit
+//     RULES_FILE wins verbatim; otherwise the first existing default
+//     candidate is probed (repo-root "conf/rules.json" first, the legacy
+//     "../../conf/rules.json" second) so the documented `go run
+//     ./cmd/serve` finds the shipped rules from the repo root;
 //   - file-level failures (missing/unreadable file, invalid JSON) return
 //     an error; the caller decides fail-loud (startup) vs keep-old-state
 //     (SIGHUP reload) — load never silently yields an empty tree;
@@ -133,10 +164,7 @@ type RuleDataItem struct {
 //     unknown types) is dropped entirely (an explicitly empty
 //     "Processors": [] stays as-is).
 func load() ([]ivy.Directive, error) {
-	var filename = os.Getenv("RULES_FILE")
-	if filename == "" {
-		filename = defaultFilename
-	}
+	filename := rulesFilename()
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("read rules file %q: %w", filename, err)
