@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tr1v3r/ivy/driver"
 )
@@ -136,9 +137,10 @@ func TestTOMLProcessor_ValueShapes(t *testing.T) {
 	})
 }
 
-// GeneralModem error paths reachable without crashing: Load failures and
-// invalid outer JSON. (The interface-type-parameter path is NOT tested:
-// checkType dereferences reflect.TypeOf(nil) and panics — a product bug.)
+// GeneralModem error paths reachable without crashing: Load failures,
+// invalid outer JSON, and invalid type-parameter shapes (interface T and
+// value-type T used to panic inside checkType/instantiation — see #55
+// and #35; both now return explicit errors).
 func TestGeneralModem_Errors(t *testing.T) {
 	t.Run("item failing Load aborts Unmarshal", func(t *testing.T) {
 		m := &driver.GeneralModem[*driver.TOMLProcessor]{
@@ -161,4 +163,51 @@ func TestGeneralModem_Errors(t *testing.T) {
 			t.Fatal("Unmarshal() error = nil, want unmarshal failure")
 		}
 	})
+
+	// Regression #55: GeneralModem instantiated with an interface T
+	// (DummyModem is GeneralModem[Processor]) panicked with a nil
+	// dereference in checkType — reflect.TypeOf of a nil interface
+	// returns nil, and typ.Kind() dereferenced it.
+	t.Run("interface type T returns error, not panic", func(t *testing.T) {
+		for name, data := range map[string][]byte{
+			"empty array":     []byte(`[]`),
+			"type mismatch":   []byte(`[123]`),
+			"garbage payload": []byte(`[{}]`),
+		} {
+			if _, err := driver.DummyModem.Unmarshal(data); err == nil {
+				t.Errorf("%s: DummyModem.Unmarshal() error = nil, want invalid-type-T error", name)
+			} else if !strings.Contains(err.Error(), "not an interface") {
+				t.Errorf("%s: DummyModem.Unmarshal() error = %v, want 'not an interface' diagnostic", name, err)
+			}
+		}
+	})
+
+	// Regression #35 (same root as #55): a value-type T passed checkType
+	// but the instantiation assert reflect.New(typ).Interface().(T)
+	// panicked with an interface-conversion failure.
+	t.Run("value type T returns error, not panic", func(t *testing.T) {
+		m := &driver.GeneralModem[valueProc]{
+			Marshaler:   json.Marshal,
+			Unmarshaler: json.Unmarshal,
+		}
+		if _, err := m.Unmarshal([]byte(`[{}]`)); err == nil {
+			t.Fatal("Unmarshal() error = nil, want invalid-type-T error")
+		} else if !strings.Contains(err.Error(), "must be a pointer type") {
+			t.Errorf("Unmarshal() error = %v, want pointer-type diagnostic", err)
+		}
+	})
 }
+
+// valueProc implements driver.Processor with value receivers only, to
+// exercise GeneralModem's rejection of value-type type parameters.
+type valueProc struct{}
+
+func (valueProc) Path() string { return "" }
+func (valueProc) Type() string { return "value" }
+func (valueProc) Process(_ *driver.RealizeContext, b []byte) ([]byte, error) {
+	return b, nil
+}
+func (valueProc) Author() string       { return "test" }
+func (valueProc) CreatedAt() time.Time { return time.Time{} }
+func (valueProc) Load([]byte) error    { return nil }
+func (valueProc) Save() []byte         { return nil }
