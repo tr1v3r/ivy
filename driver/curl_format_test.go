@@ -1,10 +1,8 @@
 package driver_test
 
 import (
-	"bytes"
-	"errors"
-	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -13,20 +11,16 @@ import (
 
 // Coverage for CURLProcessError message formatting branches that the main
 // curl suite never hits: empty body, non-UTF-8 body, truncated long details,
-// and password-style userinfo redaction. All HTTP goes through the injected
-// round-tripper — no real network.
+// and password-style userinfo redaction. All HTTP targets local httptest
+// servers (or a never-listening loopback port) — no real network.
 
 func TestCURLProcessorErrorFormatsEmptyResponseBody(t *testing.T) {
-	useHTTPClient(t, func(request *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusInternalServerError,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("")),
-			Request:    request,
-		}, nil
-	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
 
-	_, err := (&driver.CURLProcessor{URL: "https://example.test"}).Process(nil, nil)
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
 	if err == nil {
 		t.Fatal("Process() error = nil, want status error")
 	}
@@ -36,16 +30,13 @@ func TestCURLProcessorErrorFormatsEmptyResponseBody(t *testing.T) {
 }
 
 func TestCURLProcessorErrorFormatsNonUTF8ResponseBody(t *testing.T) {
-	useHTTPClient(t, func(request *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusBadGateway,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(bytes.NewReader([]byte{0xff, 0xfe, 0x00, 0x01})),
-			Request:    request,
-		}, nil
-	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte{0xff, 0xfe, 0x00, 0x01})
+	}))
+	defer srv.Close()
 
-	_, err := (&driver.CURLProcessor{URL: "https://example.test"}).Process(nil, nil)
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
 	if err == nil {
 		t.Fatal("Process() error = nil, want status error")
 	}
@@ -58,16 +49,14 @@ func TestCURLProcessorErrorTruncatesLongDetails(t *testing.T) {
 	longBody := strings.Repeat("x", 8192)
 	longHeaderValue := strings.Repeat("h", 8192)
 
-	useHTTPClient(t, func(request *http.Request) (*http.Response, error) {
-		return &http.Response{
-			StatusCode: http.StatusServiceUnavailable,
-			Header:     http.Header{"X-Long": {longHeaderValue}},
-			Body:       io.NopCloser(strings.NewReader(longBody)),
-			Request:    request,
-		}, nil
-	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Long", longHeaderValue)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(longBody))
+	}))
+	defer srv.Close()
 
-	_, err := (&driver.CURLProcessor{URL: "https://example.test"}).Process(nil, nil)
+	_, err := (&driver.CURLProcessor{URL: srv.URL}).Process(nil, nil)
 	if err == nil {
 		t.Fatal("Process() error = nil, want status error")
 	}
@@ -82,12 +71,9 @@ func TestCURLProcessorErrorTruncatesLongDetails(t *testing.T) {
 }
 
 func TestCURLProcessorRedactsURLUserPassword(t *testing.T) {
-	useHTTPClient(t, func(*http.Request) (*http.Response, error) {
-		return nil, errors.New("connection refused")
-	})
-
+	// port 1 on loopback is never listening: deterministic connection refused
 	const secret = "hunter2"
-	op := &driver.CURLProcessor{URL: "https://user:" + secret + "@example.test/path"}
+	op := &driver.CURLProcessor{URL: "https://user:" + secret + "@127.0.0.1:1/path"}
 	_, err := op.Process(nil, nil)
 	if err == nil {
 		t.Fatal("Process() error = nil, want transport error")

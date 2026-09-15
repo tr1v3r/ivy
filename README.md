@@ -79,6 +79,35 @@ RULES_FILE=./rules.json go run ./cmd/serve
 ]
 ```
 
+### curl processor security
+
+The `curl` processor owns its security posture explicitly:
+
+- **TLS verification is on by default.** Certificates are verified against
+  the system roots; rules targeting self-signed upstreams must opt in per
+  rule with `"insecure": true`.
+- **Response bodies are capped** at 10 MiB by default. `"max_bytes": N`
+  raises (or lowers) the cap; `"max_bytes": -1` disables it. An oversized
+  response fails with an explicit error instead of exhausting memory.
+- **URLs are allowlistable** process-wide: set `IVY_CURL_ALLOW_HOSTS` to a
+  comma-separated list of hostnames (e.g.
+  `IVY_CURL_ALLOW_HOSTS=example.com,api.example.org`). An unset or empty
+  variable allows every host (out-of-box default); otherwise a rule's URL —
+  and every redirect target it follows — must match one entry exactly
+  (case-insensitive, ports ignored). The URL scheme must be `http` or
+  `https`.
+
+```json
+{
+    "type": "curl",
+    "data": {
+        "url": "https://internal.local/config.json",
+        "insecure": true,
+        "max_bytes": 1048576
+    }
+}
+```
+
 ## Evaluation modes
 
 | Factory | Mode | Behavior |
