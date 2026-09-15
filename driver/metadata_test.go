@@ -306,9 +306,14 @@ func TestPathParserNameByLevel(t *testing.T) {
 		{"a/b/c", 2, "b"},
 		{"a/b/c", 3, "c"},
 		{"/a/b", 1, "a"},
-		{"a/b", 99, ""}, // out of range
-		{"", 1, ""},     // empty path
+		{"a/b", 99, ""},  // out of range
+		{"a/b", 0, ""},   // regression #54: level 0 must not panic
+		{"a/b", -1, ""},  // negative level must not panic
+		{"a/b", -99, ""}, // deeply negative level must not panic
+		{"", 1, ""},      // empty path
+		{"", 0, ""},      // empty path + level 0
 		{"/", 1, ""},
+		{"/", 0, ""}, // delimiter-only path + level 0
 	}
 	for _, item := range testcases {
 		if got := driver.SlashPathParser.GetNameByLevel(item.Path, item.Level); got != item.Name {
