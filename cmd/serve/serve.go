@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -56,19 +57,34 @@ func rulesBuilder(rules []ivy.Directive) ivy.TreeBuilder {
 }
 
 func main() {
-	web.InitForest(rulesBuilder(load()))
+	// Startup is fail-loud (#58/W5): a missing/unreadable/corrupt rules
+	// file must abort the process instead of silently serving an empty
+	// tree. The SIGHUP path below deliberately differs — a running
+	// server keeps its current forest when a reload fails.
+	directives, err := load()
+	if err != nil {
+		log.Fatalf("load rules fail: %v", err)
+	}
+	web.InitForest(rulesBuilder(directives))
 
 	// SIGHUP reloads RULES_FILE and swaps the forest in place (the swap
 	// itself is race-free: InitForest holds forestMu). This is the reload
 	// trigger replacing the removed 5s full-rebuild ticker (audit W3):
 	// content freshness belongs to RULES_TTL caching, config changes to
-	// an explicit signal.
+	// an explicit signal. A failed reload (e.g. the file was corrupted
+	// after startup) logs and keeps the current forest serving (#58):
+	// a config mistake must not take down a healthy process.
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGHUP)
 		for range ch {
 			log.Info("SIGHUP received: reloading rules")
-			web.InitForest(rulesBuilder(load()))
+			directives, err := load()
+			if err != nil {
+				log.Errorf("SIGHUP reload fail, keeping current forest: %v", err)
+				continue
+			}
+			web.InitForest(rulesBuilder(directives))
 		}
 	}()
 
@@ -101,25 +117,39 @@ type RuleDataItem struct {
 	} `json:"Processors"`
 }
 
-func load() (directives []ivy.Directive) {
+// load reads the rules file and builds directives (#58/W5):
+//
+//   - file-level failures (missing/unreadable file, invalid JSON) return
+//     an error; the caller decides fail-loud (startup) vs keep-old-state
+//     (SIGHUP reload) — load never silently yields an empty tree;
+//   - processor-level failures degrade per-op: a processor whose Load
+//     fails (e.g. a value of the wrong type) is dropped with an error
+//     naming the rule and op index. A half-unmarshaled zero-value
+//     processor must never enter a chain, where it would silently emit
+//     invalid content;
+//   - a directive whose processors all failed to Load is dropped
+//     entirely (an explicitly empty "Processors": [] stays as-is).
+//
+// Unknown processor types keep their current nil slot; that silent
+// no-op is W7's (#60) scope.
+func load() ([]ivy.Directive, error) {
 	var filename = os.Getenv("RULES_FILE")
 	if filename == "" {
 		filename = defaultFilename
 	}
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		log.Error("read file fail: %s", err)
-		return nil
+		return nil, fmt.Errorf("read rules file %q: %w", filename, err)
 	}
 
 	var items = []RuleDataItem{}
 	if err = json.Unmarshal(data, &items); err != nil {
-		log.Error("unmarshal data fail: %s", err)
-		return nil
+		return nil, fmt.Errorf("unmarshal rules file %q: %w", filename, err)
 	}
+	var directives []ivy.Directive
 	for _, line := range items {
 		var ops []driver.Processor
-		for _, opData := range line.Processors {
+		for i, opData := range line.Processors {
 			var op driver.Processor
 			switch opData.Type {
 			case "json":
@@ -135,14 +165,23 @@ func load() (directives []ivy.Directive) {
 			case "template":
 				op = new(driver.TemplateProcessor)
 			}
-			if op != nil {
-				if err := op.Load(opData.Data); err != nil {
-					log.Warn("load Process fail: %s\ndata: %s", err, opData.Data)
-				}
+			if op == nil {
+				// unknown type: nil slot, see W7 (#60)
+				ops = append(ops, op)
+				continue
+			}
+			if err := op.Load(opData.Data); err != nil {
+				log.Errorf("rules %q op %d (type %q): Load fail, op dropped: %v",
+					line.Path, i, opData.Type, err)
+				continue
 			}
 			ops = append(ops, op)
 		}
+		if len(ops) == 0 && len(line.Processors) > 0 {
+			log.Errorf("rules %q: every processor failed to Load, directive dropped", line.Path)
+			continue
+		}
 		directives = append(directives, ivy.NewDirective(line.Path, ops...))
 	}
-	return directives
+	return directives, nil
 }

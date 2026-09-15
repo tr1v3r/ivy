@@ -88,6 +88,18 @@ func readGen(t *testing.T, r *gin.Engine) (string, bool) {
 	return gen, true
 }
 
+// initForestFromRules loads the rules file the way main() does at
+// startup and swaps the forest; a file-level load failure is fatal to
+// the test (#58/W5).
+func initForestFromRules(t *testing.T) {
+	t.Helper()
+	directives, err := load()
+	if err != nil {
+		t.Fatalf("load rules fail: %s", err)
+	}
+	web.InitForest(rulesBuilder(directives))
+}
+
 func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -109,7 +121,7 @@ func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 			defer func() { ruleTTL = origTTL }()
 
 			gin.SetMode(gin.TestMode)
-			web.InitForest(rulesBuilder(load()))
+			initForestFromRules(t)
 			r := register(gin.New()) // no Recovery middleware: a panic kills the binary
 
 			if gen, ok := readGen(t, r); !ok || gen != "v1" {
@@ -148,7 +160,16 @@ func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 						}
 						return
 					}
-					web.InitForest(rulesBuilder(load()))
+					// the SIGHUP body: a failed load keeps the current forest
+					directives, err := load()
+					if err != nil {
+						select {
+						case reloadErrs <- err:
+						default:
+						}
+						return
+					}
+					web.InitForest(rulesBuilder(directives))
 					time.Sleep(2 * time.Millisecond) // pacing only, not an assertion
 				}
 			}()
@@ -196,7 +217,7 @@ func TestStressSIGHUPReloadWhileReads(t *testing.T) {
 			if err := writeRulesAtomic(file, "v2"); err != nil {
 				t.Fatalf("final rules write fail: %s", err)
 			}
-			web.InitForest(rulesBuilder(load()))
+			initForestFromRules(t)
 			if gen, ok := readGen(t, r); !ok || gen != "v2" {
 				t.Fatalf("post-reload read must serve v2, got %q", gen)
 			}
@@ -242,7 +263,7 @@ func TestStressSIGHUPReloadUpstreamCurl(t *testing.T) {
 	defer func() { ruleTTL = origTTL }()
 
 	gin.SetMode(gin.TestMode)
-	web.InitForest(rulesBuilder(load()))
+	initForestFromRules(t)
 	r := register(gin.New())
 
 	if n := hits.Load(); n != 1 {
@@ -251,7 +272,7 @@ func TestStressSIGHUPReloadUpstreamCurl(t *testing.T) {
 
 	const reloads = 50
 	for i := 0; i < reloads; i++ {
-		web.InitForest(rulesBuilder(load())) // the SIGHUP body
+		initForestFromRules(t) // the SIGHUP body
 	}
 	if n := hits.Load(); n != 1+reloads {
 		t.Fatalf("each reload must re-fetch exactly once: want %d, got %d", 1+reloads, n)
