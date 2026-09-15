@@ -11,9 +11,11 @@ import (
 )
 
 // load() processor-type switch: every known type must map to the right
-// Processor implementation, unknown types yield a nil processor slot
-// (W7/#60 scope), and a Load failure drops the op (#58/W5) — a
-// half-unmarshaled zero-value processor never enters the chain.
+// Processor implementation, unknown types are dropped with an error
+// (#60/W7 — a nil slot used to silently no-op), and a Load failure drops
+// the op (#58/W5) — a half-unmarshaled zero-value processor never enters
+// the chain. A directive whose ops were all dropped (/bad, /unknown)
+// is dropped with it.
 func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 	rules := `[
 		{"path":"/all","Processors":[
@@ -41,9 +43,12 @@ func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load fail: %s", err)
 	}
-	// /bad is dropped: its only op failed to Load (#58/W5)
-	if len(directives) != 2 {
-		t.Fatalf("expect 2 directives (/bad dropped), got %d", len(directives))
+	// /bad and /unknown are both dropped: their only op failed to Load
+	// (#58/W5) / had an unknown type (#60/W7), and a directive with no
+	// surviving ops is dropped with them
+	if len(directives) != 1 {
+		t.Fatalf("expect 1 directive (/bad and /unknown dropped), got %d (%s)",
+			len(directives), directivePaths(directives))
 	}
 
 	// the per-format processors' Type() returns their operation type
@@ -69,20 +74,9 @@ func TestLoad_ProcessorTypeSwitch(t *testing.T) {
 		}
 	}
 
-	// /bad: the only op failed to Load (data 42 does not unmarshal into
-	// a processor), so the op is dropped and the directive with it — a
-	// zero-value processor must never enter a chain (#58/W5)
-	if directives[1].Path() != "/unknown" {
-		t.Errorf("expected /bad to be dropped, directives are %s", directivePaths(directives))
-	}
-
-	// unknown type: op stays nil but keeps its slot
-	unknown := directives[1].Processors()
-	if len(unknown) != 1 {
-		t.Fatalf("expect 1 processor on /unknown, got %d", len(unknown))
-	}
-	if unknown[0] != nil {
-		t.Errorf("unknown type should leave nil processor, got %T", unknown[0])
+	// /all is the only survivor
+	if directives[0].Path() != "/all" {
+		t.Errorf("expected only /all to survive, directives are %s", directivePaths(directives))
 	}
 }
 
