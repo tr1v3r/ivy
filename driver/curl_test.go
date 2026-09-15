@@ -1,11 +1,14 @@
 package driver_test
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tr1v3r/ivy/driver"
 	"github.com/tr1v3r/pkg/fetch"
@@ -171,5 +174,76 @@ func TestCURLProcessorKeepsSuccessfulResponse(t *testing.T) {
 	}
 	if got := string(content); got != "ok" {
 		t.Errorf("Process() content = %q, want %q", got, "ok")
+	}
+}
+
+// TestCURLProcessorHonorsRealizeContextCancellation guards issue #51 (M1):
+// Process must propagate the RealizeContext cancellation to the outbound
+// request instead of discarding it and running to the fetch client's
+// fallback timeout.
+func TestCURLProcessorHonorsRealizeContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Slow upstream: outlives the caller's cancellation window but stays
+		// well below any fallback timeout, so the only way Process returns
+		// early is honoring rc.Context.
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte("slow"))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel() // caller gives up while the upstream is still sleeping
+	}()
+	rc := &driver.RealizeContext{Context: ctx}
+	op := &driver.CURLProcessor{URL: srv.URL}
+
+	start := time.Now()
+	content, err := op.Process(rc, nil)
+	duration := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("Process() error = nil (content=%q), want context.Canceled after rc.Context was canceled", content)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Process() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	var processErr *driver.CURLProcessError
+	if !errors.As(err, &processErr) {
+		t.Fatalf("Process() error type = %T, want *driver.CURLProcessError with diagnostics", err)
+	}
+	if duration >= 250*time.Millisecond {
+		t.Fatalf("Process() returned after %v, want cancellation noticed well before the 300ms upstream response (context not propagated)", duration)
+	}
+}
+
+// TestCURLProcessorWithoutRealizeContextContext keeps the nil-context corner
+// safe: a RealizeContext without an embedded Context (or no rc at all) must
+// still perform a normal, uncanceled request.
+func TestCURLProcessorWithoutRealizeContextContext(t *testing.T) {
+	useHTTPClient(t, func(request *http.Request) (*http.Response, error) {
+		if request.Context() == nil {
+			t.Error("outbound request carries no context")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Request:    request,
+		}, nil
+	})
+
+	for name, rc := range map[string]*driver.RealizeContext{
+		"nil rc":              nil,
+		"rc without embedded": {},
+	} {
+		content, err := (&driver.CURLProcessor{URL: "https://example.test"}).Process(rc, nil)
+		if err != nil {
+			t.Fatalf("%s: Process() error = %v, want nil", name, err)
+		}
+		if got := string(content); got != "ok" {
+			t.Errorf("%s: Process() content = %q, want %q", name, got, "ok")
+		}
 	}
 }

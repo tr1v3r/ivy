@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -232,5 +234,51 @@ func TestDefaultBuilder(t *testing.T) {
 	}
 	if !strings.Contains(string(val), "ivy") {
 		t.Errorf("unexpected rule: %s", val)
+	}
+}
+
+// TestGetRule_CancelsUpstreamFetch guards issue #51 (M1) end to end: the
+// gin request context flows through GetRule -> RealizeContext ->
+// CURLProcessor into the outbound request, so a client that disconnects
+// aborts the upstream fetch instead of occupying it until the fallback
+// timeout.
+func TestGetRule_CancelsUpstreamFetch(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte("slow"))
+	}))
+	defer upstream.Close()
+
+	// instant tree: re-realizes per request, so the curl processor runs with
+	// the request-scoped RealizeContext on every query
+	InitForest(func() ivy.Tree {
+		tree, err := ivy.NewLazyInstantTree[ivy.Directive](driver.NewJSONDriver(), treeName, `{}`,
+			ivy.NewDirective("/", &driver.CURLProcessor{URL: upstream.URL}))
+		if err != nil {
+			t.Fatalf("build tree fail: %s", err)
+		}
+		return tree
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel() // client disconnects while the upstream is still sleeping
+	}()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rule?name=default&path=/", nil).WithContext(ctx)
+
+	start := time.Now()
+	w := httptest.NewRecorder()
+	newTestRouter().ServeHTTP(w, req)
+	duration := time.Since(start)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expect 500 after client cancellation, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "canceled") {
+		t.Errorf("expected cancellation error payload, got %s", w.Body.String())
+	}
+	if duration >= 250*time.Millisecond {
+		t.Fatalf("handler returned after %v, want client cancellation noticed well before the 300ms upstream response (request context not propagated)", duration)
 	}
 }
