@@ -1,6 +1,6 @@
 module github.com/tr1v3r/ivy
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/gin-gonic/gin v1.12.0
@@ -11,7 +11,7 @@ require (
 	github.com/tidwall/gjson v1.14.2
 	github.com/tidwall/sjson v1.2.5
 	github.com/tr1v3r/pkg v0.2.1
-	github.com/tr1v3r/stream v0.1.0
+	github.com/tr1v3r/stream v0.3.0
 	golang.org/x/time v0.3.0
 	gopkg.in/yaml.v3 v3.0.1
 )
