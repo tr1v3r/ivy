@@ -27,6 +27,7 @@ func (t *tree) topologyRoot() *tree {
 // shared lock pointer to recursively rewrite in its descendants. Callers must
 // not invoke processors or foreign Tree methods while these locks are held.
 func lockTopologyRoots(nodes ...*tree) func() {
+retry:
 	for {
 		roots := make([]*tree, 0, len(nodes))
 		for _, node := range nodes {
@@ -46,19 +47,14 @@ func lockTopologyRoots(nodes ...*tree) func() {
 			root.topologyMu.Lock()
 		}
 
-		valid := true
 		for _, node := range nodes {
 			if node != nil && !slices.Contains(roots, node.topologyRoot()) {
-				valid = false
-				break
+				unlockTopologyRoots(roots)
+				continue retry
 			}
 		}
 
-		if valid {
-			return func() { unlockTopologyRoots(roots) }
-		}
-
-		unlockTopologyRoots(roots)
+		return func() { unlockTopologyRoots(roots) }
 	}
 }
 
