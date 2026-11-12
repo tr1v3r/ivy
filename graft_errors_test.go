@@ -60,7 +60,7 @@ func TestGraft_InvalidStructureIsNotMissingTree(t *testing.T) {
 	}
 }
 
-func TestWouldCreateGraftCycleChecksTreeStructure(t *testing.T) {
+func TestCycleCheck(t *testing.T) {
 	root := graftTestTree(t, "lazy", "ROOT", NewDirective("/child/leaf"))
 	child := root.pickChild("child").(*tree)
 	leaf := child.pickChild("leaf").(*tree)
@@ -79,8 +79,8 @@ func TestWouldCreateGraftCycleChecksTreeStructure(t *testing.T) {
 		{"unrelated", other, leaf, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := wouldCreateGraftCycle(tc.source, tc.parent); got != tc.want {
-				t.Fatalf("wouldCreateGraftCycle = %v; want %v", got, tc.want)
+			if got := cycleCheck(tc.source, tc.parent); got != tc.want {
+				t.Fatalf("cycleCheck = %v; want %v", got, tc.want)
 			}
 		})
 	}

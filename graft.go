@@ -55,7 +55,7 @@ func (t *tree) Graft(path string, source Tree) error {
 	if nativeSource != nil {
 		// Reject a structural cycle before taking the source realization lock,
 		// including a callback trying to graft its own currently realizing tree.
-		if wouldCreateGraftCycle(nativeSource, t) {
+		if cycleCheck(nativeSource, t) {
 			return fmt.Errorf("graft would create a cycle")
 		}
 
@@ -89,10 +89,10 @@ func isNilTree(source Tree) bool {
 	}
 }
 
-// wouldCreateGraftCycle checks whether source is parent itself or an ancestor
+// cycleCheck checks whether source is parent itself or an ancestor
 // of parent. Attaching it below parent would form a tree-structure cycle; this
 // function does not inspect locks or detect mutex deadlocks.
-func wouldCreateGraftCycle(source, parent *tree) bool {
+func cycleCheck(source, parent *tree) bool {
 	for {
 		if source == parent {
 			return true
@@ -135,7 +135,7 @@ func (t *tree) graftNative(q pathQuery, source Tree, nativeSource *tree) (Tree, 
 	}
 
 	if nativeSource != nil {
-		if wouldCreateGraftCycle(nativeSource, parent) {
+		if cycleCheck(nativeSource, parent) {
 			return nil, "", fmt.Errorf("graft would create a cycle")
 		}
 
