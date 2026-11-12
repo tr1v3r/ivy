@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -142,8 +143,8 @@ func (t *tree) Path() string {
 	}
 
 	path := ""
-	for i := len(names) - 1; i >= 0; i-- {
-		path = root.driver.AppendPath(path, names[i])
+	for _, name := range slices.Backward(names) {
+		path = root.driver.AppendPath(path, name)
 	}
 
 	return path
@@ -249,8 +250,7 @@ func (t *tree) ancestorContent(rc *driver.RealizeContext, binding *treeMount) ([
 
 	var content []byte
 	var version uint64
-	for i := len(ancestors) - 1; i >= 0; i-- {
-		ancestor := ancestors[i]
+	for _, ancestor := range slices.Backward(ancestors) {
 		if err := ancestor.node.realizeWithParentCtx(rc, content, version, ancestor.binding); err != nil {
 			return nil, 0, fmt.Errorf("realize ancestor at %q: %w", ancestor.node.Path(), err)
 		}
@@ -567,9 +567,7 @@ func (t *tree) delQuery(q pathQuery) error {
 func (t *tree) ShowStruct() []byte {
 	t.mu.RLock()
 	children := make(map[string]Tree, len(t.children))
-	for name, child := range t.children {
-		children[name] = child
-	}
+	maps.Copy(children, t.children)
 
 	t.mu.RUnlock()
 	m := make(map[string]json.RawMessage, len(children))
