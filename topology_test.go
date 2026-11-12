@@ -287,7 +287,7 @@ func TestNativeTopology_LockHelperDeduplicatesCurrentRoot(t *testing.T) {
 	acquired, release := make(chan struct{}), make(chan struct{})
 	releaseTask := sync.OnceFunc(func() { close(release) })
 	task := startTopologyTestTask(func() error {
-		unlock := lockNativeTopology(root, child, root, child)
+		unlock := lockTopologyRoots(root, child, root, child)
 		close(acquired)
 		<-release
 		unlock()

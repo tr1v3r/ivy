@@ -16,7 +16,7 @@ func (t *tree) topologyRoot() *tree {
 	}
 }
 
-// lockNativeTopology locks only the enclosing roots of the involved nodes.
+// lockTopologyRoots locks only the enclosing roots of the involved nodes.
 // Root addresses impose a consistent lock order without a global mutex or ID
 // allocator; references remain live throughout acquisition and release.
 //
@@ -25,7 +25,7 @@ func (t *tree) topologyRoot() *tree {
 // On detach, the subtree root's own mutex becomes active again; there is no
 // shared lock pointer to recursively rewrite in its descendants. Callers must
 // not invoke processors or foreign Tree methods while these locks are held.
-func lockNativeTopology(nodes ...*tree) func() {
+func lockTopologyRoots(nodes ...*tree) func() {
 	for {
 		roots := make([]*tree, 0, len(nodes))
 		for _, node := range nodes {
@@ -50,13 +50,13 @@ func lockNativeTopology(nodes ...*tree) func() {
 			}
 		}
 		if valid {
-			return func() { unlockNativeRoots(roots) }
+			return func() { unlockTopologyRoots(roots) }
 		}
-		unlockNativeRoots(roots)
+		unlockTopologyRoots(roots)
 	}
 }
 
-func unlockNativeRoots(roots []*tree) {
+func unlockTopologyRoots(roots []*tree) {
 	for i := len(roots) - 1; i >= 0; i-- {
 		roots[i].topologyMu.Unlock()
 	}

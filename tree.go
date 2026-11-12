@@ -536,7 +536,7 @@ func (t *tree) ShowStruct() []byte {
 
 // deleteNode delete a node from tree.
 func (t *tree) deleteNode(name string) error {
-	unlock := lockNativeTopology(t)
+	unlock := lockTopologyRoots(t)
 	defer unlock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -555,7 +555,7 @@ func (t *tree) getChild(name string) (Tree, error) {
 	}
 	// Recheck while inserting so concurrent Set calls cannot replace each
 	// other's newly created intermediate nodes. No processor runs here.
-	unlock := lockNativeTopology(t)
+	unlock := lockTopologyRoots(t)
 	defer unlock()
 	t.mu.Lock()
 	defer t.mu.Unlock()

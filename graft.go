@@ -101,7 +101,7 @@ func (t *tree) graftNative(q pathQuery, source Tree, native *tree) (Tree, string
 		native.realizeMu.Lock()
 		defer native.realizeMu.Unlock()
 	}
-	unlock := lockNativeTopology(t, native)
+	unlock := lockTopologyRoots(t, native)
 	defer unlock()
 	parent := t
 	for !q.next().done() {
