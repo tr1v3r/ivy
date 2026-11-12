@@ -157,27 +157,32 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
+	source.prepareForGraft()
+
 	if previousTree, ok := parent.children[name].(*tree); ok {
 		previousTree.mount.Store(nil)
 	}
-
-	// Only the source root needs invalidation: its next publication has a
-	// newer contentVer, which transitively invalidates all descendants.
-	// pendingBase keeps standard descendant Set from using the old template.
-	source.basePending.Store(true)
-	source.realizedAt = time.Time{}
-	source.realizedFrom = 0
-
-	source.contentMu.Lock()
-	source.base = nil
-	source.content = nil
-	source.contentVer++
-	source.contentMu.Unlock()
 
 	source.mount.Store(&treeMount{parent: parent, name: name})
 	parent.children[name] = source
 
 	return nil, "", nil
+}
+
+// prepareForGraft invalidates cached output without running processors. The
+// current base is retained until a read supplies the new parent's content.
+// Callers must hold its realizeMu and enclosing-root topology lock.
+func (t *tree) prepareForGraft() {
+	// A newer root contentVer transitively invalidates descendant caches.
+	// pendingBase keeps standard descendant Set from using the old template.
+	t.basePending.Store(true)
+	t.realizedAt = time.Time{}
+	t.realizedFrom = 0
+
+	t.contentMu.Lock()
+	t.content = nil
+	t.contentVer++
+	t.contentMu.Unlock()
 }
 
 // graftTree attaches a custom source by reference. Its implementation owns

@@ -183,8 +183,9 @@ Native mounting has these semantics:
   caller's responsibility. Native node aliases must also be representable in
   every enclosing native path grammar; incompatible names are rejected rather
   than creating nodes that root or retained-handle queries cannot address.
-- Mounting invalidates the source subtree's cached template/results for its
-  new inheritance. Content now flows from the destination parent.
+- Mounting invalidates cached results, retaining the last base until access
+  replaces it with the destination parent's content (even when that is nil).
+  Detaching before that access preserves the previous base.
   **`Graft` never executes processors**, even for standard nodes. Mounted
   standard nodes first re-evaluate on access and recompose when the parent
   publication changes; lazy, instant and TTL modes retain their own caching

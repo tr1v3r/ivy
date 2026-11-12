@@ -84,7 +84,7 @@ Note: most web routes (`template`, `info`, `mod`, `list`, `config`) are currentl
 - The target path is receiver-local, must be non-root, and must have an existing parent. Its final segment is the mount alias; replacement is whole-subtree replacement, not a merge.
 - Native mounting attaches the exact source object. Retained source references still edit the mounted object; source drivers, processors, modes, rate limiters and context objects are not copied or replaced.
 - A native source must be detached and single-parent. Reject self/cycle/duplicate ownership. Replacement and `Del` detach removed native subtrees so they can be remounted.
-- Invalidate source template/results caches for new parent inheritance, but never execute processors in `Graft`, including standard processors. Mounted standard nodes wait for access and recompose when their parent publication changes.
+- Invalidate source result caches for new parent inheritance, but retain its last base until access replaces it with the new parent content (including nil). Detaching before access preserves that prior base. Never execute processors in `Graft`, including standard processors. Mounted standard nodes wait for access and recompose when their parent publication changes.
 - Preserve source modes independently. Parameter-aware processors remain target-only and never enter the static cache.
 - Do not assume arbitrary custom implementations provide native inheritance or position tracking. Each implementation controls its own semantics/concurrency; the `Tree` interface imposes no lock policy.
 - Forest refresh reruns builders and replaces trees. Recreate source trees and mounting steps inside `TreeBuilder` when composition must survive refresh.
