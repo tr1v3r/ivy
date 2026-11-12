@@ -1,7 +1,7 @@
 # ivy
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)](https://go.dev)
 
 A hierarchical content-construction engine for Go: content starts from a root
 template and flows down a path-addressed tree, where every node applies a
@@ -113,11 +113,117 @@ The `curl` processor owns its security posture explicitly:
 | Factory | Mode | Behavior |
 |---|---|---|
 | `NewJSONTree` | standard | static prefix computed at build time |
-| `NewLazyJSONTree` | lazy | nodes created and realized on access |
+| `NewLazyJSONTree` | lazy | static content realized on first access |
 | `NewLazyInstantJSONTree` | instant | recompute on every access |
 | `NewLazyCacheJSONTree` | cache TTL | lazy semantics with expiry-based recompute |
 
 (Same variants exist for YAML, TOML, XML, and Tile drivers.)
+
+### Direct subtree mounting and mixed modes
+
+Use `root.Graft(path, source)` to insert or replace an entire subtree at a
+non-root path. Missing native intermediate nodes are created automatically,
+using their parent's configuration without running processors. The source is
+attached **directly**: there is no clone and no separate `GraftAt` function.
+An existing custom `Tree` receives the remaining suffix and controls creation
+within its own subtree.
+
+```go
+root, err := ivy.NewJSONTree[ivy.Directive]("cfg", `{"enabled":true}`)
+if err != nil {
+    return err
+}
+branch, err := ivy.NewLazyJSONTree("branch", `{}`,
+    ivy.NewDirective("/", &driver.JSONProcessor{
+        T: "create", JSONPath: "region", V: []byte("beijing"),
+    }),
+)
+if err != nil {
+    return err
+}
+if err := root.Graft("/api", branch); err != nil {
+    return err
+}
+value, err := root.Get("/api") // {"enabled":true,"region":"beijing"}
+```
+
+The target name is the mount alias (`api`), not `source.Name()` (`branch`).
+For native trees, `branch.Path()` now returns `/api`; `ShowStruct()` uses mount
+aliases as keys. `branch` is still the same object: editing it affects the
+mounted branch, rather than a private copy.
+
+Keep subsequent operations root-oriented, including mounting below a branch
+that was itself mounted earlier:
+
+```go
+live, err := ivy.NewLazyInstantJSONTree[ivy.Directive]("live-source", `{}`)
+if err != nil {
+    return err
+}
+// The missing /api/users parent is created inside the mounted branch.
+if err := root.Graft("/api/users/live", live); err != nil {
+    return err
+}
+value, err = root.Get("/api/users/live")
+```
+
+All public path-taking calls are **local to the receiver's tree root**, even
+when the path begins with `/`. For example, `branch.Has("/users/live")` examines
+the same node as `root.Has("/api/users/live")`; it does not interpret `/users`
+as a path from the outer root. Native traversal parses once and consumes path
+segments. When it delegates to a custom `Tree`, the public method receives the
+remaining suffix string, not the original whole-tree query.
+
+Native mounting has these semantics:
+
+- Existing descendants at the target are replaced, not merged. The source
+  must be detached and may have only one parent; self-mounts, cycles and
+  duplicate ownership are rejected. Replacement and `Del` detach the removed
+  native subtree so it can be mounted again elsewhere.
+- Every source node keeps its own driver, processors, evaluation mode, rate
+  limiter and context objects. These are the same objects, not copies.
+  Matching content formats (or an explicit conversion processor) is the
+  caller's responsibility. At mount time, `Graft` validates native source names
+  and the target alias against enclosing native path grammars. Native `Set`
+  follows its entry parser, including interior empty segments, without this
+  extra name validation. Callers maintaining views with different parsers must
+  keep later edits compatible with the views they use.
+- Mounting invalidates cached results, retaining the last base until access
+  replaces it with the destination parent's content (even when that is nil).
+  Detaching before that access preserves the previous base.
+  **`Graft` never executes processors**, even for standard nodes. Mounted
+  standard nodes first re-evaluate on access and recompose when the parent
+  publication changes; lazy, instant and TTL modes retain their own caching
+  behavior. Parameter-aware output remains per-query, never cached.
+- Native positions derive dynamically from parent/mount-alias links rather
+  than a stored absolute level. Moving a detached subtree therefore does not
+  require rewriting every descendant's absolute path.
+
+The `Tree` interface does not prescribe a locking policy. Each implementation
+owns its concurrency guarantees; do not assume native inheritance or position
+tracking applies to arbitrary custom implementations. Native structural edits
+lock only the involved enclosing roots: independent trees do not share a
+package-wide mutex. Cross-tree grafts acquire source/target root locks in a
+consistent order and recheck ownership after acquisition; detached subtrees
+activate their own instance lock without rewriting descendants.
+Public source references
+remain aliases to the attached object, so coordinate edits according to that
+implementation's contract. Native retained-handle reads resolve ancestor static
+content too, including on the first read after mounting or an ancestor refresh.
+Native reads check mount identity as well as parent content versions and retry
+from their entry root when ownership changes during a query. This prevents an
+old parent's snapshot from populating a remounted subtree's cache; processors
+may run again during a retried query. Native realization is not reentrant: do
+not transfer a detached source from inside a processor currently realizing
+that same source.
+
+`Forest.Refresh` / `RefreshTree` rebuild trees through their `TreeBuilder`;
+put the mounting steps in the builder to recreate the same composition on
+refresh. Runtime mounts are not automatically replayed onto a newly built tree.
+
+**Breaking API change:** `Graft(Tree)` is now
+`Graft(path string, source Tree) error`. Callers must provide a target path and
+check the error; custom `Tree` implementations must update their method.
 
 ## Development
 

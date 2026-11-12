@@ -18,10 +18,12 @@
 
 四种求值模式（同一 `tree` 结构体的开关组合，见 `tree.go` 字段注释）：
 
-- **standard**：建树时（`tree.apply` → `realize`）把静态前缀算完缓存；
-- **lazy**：初始化只有根节点，访问时才建节点、才算内容（`inherit` + `getChild`/`newSubTree`）；
-- **instant**：每次访问强制重算（`realizeWithContext` 跳过缓存判断）；
-- **cache TTL**：lazy 语义 + `realizedAt`/`cacheTTL` 过期重算（`needRealize`、`realizeWithContext` 的双检查锁）。
+- **standard**：初始建树时把静态前缀算完缓存；挂载后缓存失效，首次访问及父内容版本更新时重新组合；
+- **lazy**：配置可先建立节点拓扑，静态内容延后到首次访问时计算；
+- **instant**：每次访问强制重算；
+- **cache TTL**：lazy 语义 + `realizedAt`/`cacheTTL` 过期重算。
+
+挂载保留每个节点的求值模式，但 `Graft` 本身不执行任何处理器。
 
 ## 2. 模块地图
 
@@ -65,7 +67,7 @@ type Tree interface {
     Get(path string) ([]byte, error)
     GetWithContext(rc *driver.RealizeContext, path string) ([]byte, error)
     Has(path string) bool; Del(path string) error
-    Graft(Tree)
+    Graft(path string, source Tree) error
     ShowStruct() []byte
     SetRateLimit(r rate.Limit, burst int)
     SetFallback(proc driver.Processor)
@@ -74,7 +76,10 @@ type Tree interface {
 ```
 
 - 实现方：`tree`（`tree.go`），递归组合（children 也是 `Tree`）。
-- 切分理由：`Set` 建树、`Get/GetWithContext` 读路径（后者支持参数化动态层），`Graft` 允许嫁接子树，`SetFallback` 兜住"路径解析不到子节点"的场景（如通配路由）。
+- 切分理由：`Set` 建树、`Get/GetWithContext` 读路径（后者支持参数化动态层），`Graft` 按目标路径直接挂接同一个子树对象，`SetFallback` 兜住"路径解析不到子节点"的场景（如通配路由）。
+- 路径契约：所有公开路径调用相对接收者自己的树根解析，不以挂载后的绝对 `Path()` 为输入前缀；推荐始终从最外层 root 操作。内置实现的 `Path()` 动态沿父节点和挂载别名计算，`ShowStruct()` 的键使用挂载别名，不使用源树 `Name()`。
+- **Breaking change**：旧 `Graft(Tree)` 改为 `Graft(path string, source Tree) error`，调用者和自定义 `Tree` 实现均需适配；不提供 `Clone` 或独立的 `GraftAt` 函数。
+- 接口不规定锁策略，也不承诺任意自定义树都具备内置实现的继承、位置维护和并发语义。
 
 ```go
 type Directive interface {
@@ -128,6 +133,66 @@ type ParamAware interface { ParamKeys() []string }
 - 静态前缀 `procs[:dynamicFrom]`：按 standard/lazy/instant/TTL 原语义 realize 并缓存；
 - 动态层 `procs[dynamicFrom:]`：仅在**目标节点**由 `dynamicRealize` 在每次 `GetWithContext` 时叠加请求上下文重算，结果只返回给调用者、**从不写回节点缓存**（`tree.go` 注释明确此契约）——不同参数永不互相污染。
 
+### 3.4 直接挂接与局部路径递归（`Tree.Graft`）
+
+`root.Graft("/api/config", source)` 直接把 **source 本身** 挂到指定位置，
+不复制对象。缺失的原生中间节点（如 `/api`）会自动补齐，沿用父节点配置且不执行处理器；
+目标不能是接收者的根，原目标子树整体替换。
+`source.Name()` 可以与别名 `config` 不同，原生 `source.Path()` 根据新父链返回
+`/api/config`。继续执行 `root.Graft("/api/config/live", other)` 会进入已经挂载的树。
+
+入口只按源类型分派一次：`graftNativeTree` 接收非空 `*tree`，集中处理原生源的锁、归属和
+缓存；`graftTree` 接收其他 `Tree`，只修改目标连接，不操作源的内部状态。两条流程
+复用 `locateGraftTarget` 查找目标。遇到自定义目标时，统一在 helper 释放锁之后由入口
+调用 `targetTree.Graft(remainingPath, source)`，不把可空的原生源参数贯穿各个步骤。
+
+```text
+【局部寻址：入口解析一次，cursor 逐段消费】
+root.Graft("/api/config/live", source)
+│ root   剩余 api/config/live → 找到 api，缺失则在现有父节点写锁内补齐原生父链
+│ api    剩余 config/live     → 找到或创建 config（可能是此前挂载的树）
+└─ config 剩余 live           → 替换 children["live"]
+   └─ 遇到自定义 Tree → 公开方法只接收剩余后缀字符串，不传原始整树路径
+
+【内置实现的直接挂载】
+校验：源必须未挂载；拒绝自我挂载、环与重复归属
+│ 保留同一源对象及其 Driver / Processor / 模式 / 限流器 / 上下文对象
+│ 记录 parent + mount alias，不递归写入绝对 path / level
+│ 失效源的求值状态与结果缓存；保留旧基底，首次读取时由新父内容覆盖（包括 nil）
+│ 校验后在最近现有父节点的写锁内补齐父链，接上 source 后解锁发布
+└─ 替换目标引用；被替换的原生子树解除归属，Del 同样解除归属
+   └─ 脱离父节点后的子树可重新挂载到其他位置
+
+【求值：Graft 不执行处理器】
+挂载后的首次 Get → 从新父内容计算，包括 standard 节点
+│ 父版本未变 → 按节点自身模式命中 / TTL 过期 / instant 重算
+└─ 父版本更新 → 所有模式重新组合，包括 standard 和更长 TTL 的子节点
+   └─ nil 父内容也有效；从父基底开始，不从上次处理结果重复叠加
+```
+
+所有公开路径调用均使用接收者的局部根坐标。若 `branch` 挂载于 `/api/config`，
+`branch.Has("/users")` 与 `root.Has("/api/config/users")` 定位同一个节点，
+但 `branch.Has("/api/config/users")` 不会自动剥去挂载前缀。原生查询上下文的
+`TreePath` 仍可使用动态推导的挂载位置；寻址本身不依赖节点的旧绝对层级。
+
+挂载后保留的 `source` 变量仍指向同一个对象，局部编辑会反映到目标树；推荐后续操作
+统一走最外层 root，避免混淆局部路径与位置展示。挂载不会复制或重置限流器、替换源的
+Driver 或默认上下文对象。格式兼容或转换由调用者负责。参数动态层仍只作用于查询目标，
+不会进入静态缓存。通过已挂载句柄直接查询时，先按父链求值祖先静态内容，确保首访
+和祖先刷新后也获得正确继承；祖先动态层仍跳过。`Graft` 在拓扑锁下校验目标别名和
+源节点名称是否兼容外层原生路径语法。`Set` 保留入口解析器的分段结果，不额外校验
+名称；后续编辑若需通过其他解析器视图访问，由调用者维护兼容性。
+原生查询还携带挂载身份，并在求值锁内校验；并发换父节点时从查询入口重试，防止
+旧父节点的较大版本号污染新位置的缓存。挂载校验与引用发布处于同一拓扑临界区。
+拓扑锁归属于每个原生实例：结构操作解析并锁定当前外层 root，跨树移植只按固定顺序
+锁源与目标涉及的 root；拿锁后重新校验当前归属，迁入未锁定 root 时释放并重试。
+独立树之间没有包级锁竞争。子树脱离时启用自身实例锁，不递归改写后代的锁引用。
+
+以上继承、动态位置和单父归属保证属于内置实现；不能据此推断任意自定义 `Tree`
+也能做到相同处理。接口仅规定方法和路径委派边界，并发与锁策略由具体实现负责。
+`Forest.Refresh` / `RefreshTree` 重跑 `TreeBuilder` 后替换树，不能自动保留旧树上的
+运行时挂载；需在 builder 中重新构建源树并执行挂载。
+
 ## 4. 构建流程走透
 
 ### 路径 A：HTTP 服务（JSON 规则文件 → webDriver 树 → 查询）
@@ -135,10 +200,10 @@ type ParamAware interface { ParamKeys() []string }
 1. **入口** `cmd/serve/serve.go:main`：读环境变量 `SHUTDOWN_TIMEOUT`，调 `load()`。
 2. **`load()`**：读 `RULES_FILE`（默认 `../../conf/rules.json`），反序列化为 `[]RuleDataItem{Path, Processors[]{Type, Data}}`；按 `type` 字符串分发到 `driver.JSONProcessor`/`YAMLProcessor`/`CURLProcessor`/`XMLProcessor`/`TOMLProcessor`/`TemplateProcessor`，逐个 `op.Load(opData.Data)`，最后 `ivy.NewDirective(line.Path, ops...)` 组装出 `[]ivy.Directive`。
 3. **`web.InitForest(web.DefaultBuilder(directives...))`**（`web/server.go`）：`DefaultBuilder` 返回一个 `TreeBuilder`，内部用 `webDriver`（`SlashPathParser` + `StdRealizer` + `DummyModem`）调 `ivy.NewTree(driver, "default", "{}", directives...)` 建 standard 模式树；`InitForest` 再 `ivy.NewForest(builders...)` 触发 `forest.Build()`。
-4. **建树** `factory.go:NewTree` → `newTree` → `buildTree` → `tree.build(directives...)`：`byLevel()` 按层级排序后逐条 `tree.Set(r)`——`Set` 比对 `driver.GetLevel(r.Path())` 与当前 `t.level`，匹配则 `apply`（记录 `procs`、算 `dynamicFrom`，standard 模式立即 realize 静态前缀），不匹配则 `getChild(...).Set(r)` 递归下钻（lazy 地 `newSubTree` 并 `Graft`）。
-5. **后台刷新**：`main` 起 goroutine 每 5s `web.RefreshForest()` → `f.Build()` 重跑全部 builder，拾取规则文件变化。
+4. **建树** `factory.go:NewTree` → `newTree` → `buildTree` → `tree.build(directives...)`：`byLevel()` 按路径深度排序后逐条 `tree.Set(r)`；遍历按局部路径游标下钻，目标节点记录 `procs` 并计算 `dynamicFrom`，standard 模式初始构建时计算静态前缀。内部创建节点与公共 `Graft` 的移植操作分离，不再依赖绝对 `t.level` 判断目标。
+5. **配置与内容刷新**：SIGHUP 重载规则配置，`RULES_TTL` 控制内容缓存过期后的按需求值；不靠周期性重建整片 Forest 刷新内容。显式调用 Forest 刷新仍会重跑 builder，组合树必须在 builder 中重新挂载。
 6. **查询** `GET /api/v1/rule?name=...&path=...`（`web/route.go` → `web/handler.go:GetRule`）：把除 `name`/`path` 外的所有 query 参数塞进 `driver.RealizeContext.Params`，调 `f.Get(name).GetWithContext(&rc, path)`。
-7. **树内遍历**（`tree.go:GetWithContext`）：每个节点先 `realizeWithContext(rc, staticProcs())`（读锁快路径 + 写锁双检查 + 模式开关 + 限流），未到目标层则 `pickChild` 下钻并 `inherit(t)` 把父内容传给子（lazy 首访时充当初始内容），同时 `rc.ParentContent = t.get()`；到达目标层后 `dynamicRealize(rc)` 叠加动态层返回；找不到子节点走 `doFallback`。
+7. **树内遍历**（`tree.go:GetWithContext`）：入口解析一次局部路径，游标逐段消费。每个原生节点先校验/计算静态缓存，再携带成对的父内容与版本继续下钻；目标节点执行参数动态层，缺失节点走 fallback。`TreePath` 从挂载父链推导，定位不依赖旧绝对层级。跨自定义 `Tree` 边界时仅传剩余后缀字符串，对方自行定义继承和并发行为。
 8. **落盘响应**：`GetRule` 把结果 JSON 写回客户端；`Serve`（`web/server.go`）负责 `:8080` 监听与信号驱动的优雅关停。
 
 ### 路径 B：SDK 内嵌（curl 拉远程内容 → YAML 树，`export_test.go` 有等价用例）
@@ -223,16 +288,19 @@ graph TD
 
 - **接口在 export.go、实现全小写**（推断自文件组织）：强制消费方面向 `Forest/Tree/Directive` 编程，未来可换实现。
 - **Driver = PathParser + Realizer + Modem 三接口嵌入**（代码结构自明）：路径语义、链执行、序列化三者正交，`DelimiterPathParser.WithDelimiter` 让非斜杠格式（如 XML 内部路径）可复用全部树逻辑。
-- **四种模式用布尔/字段开关而非子类**（推断）：lazy/instant/TTL 只是 `realizeWithContext` 里缓存判断的分支差异，组合爆炸用字段组合表达，避免类层次膨胀。
+- **四种模式用布尔/字段开关而非子类**：lazy/instant/TTL 通过节点自身的缓存判断分支表达，避免类层次膨胀；混合模式挂载保留这些字段，不改变源节点类型。
 - **动态层"只返回不写缓存"**（`tree.go` 注释明示）：让参数化查询与四种缓存模式正交共存——这是本引擎最核心的取舍：宁可每次查询重放动态层（性能），也要保证静态缓存与参数无关（正确性）。
-- **读写锁双检查**（`realizeWithContext`，注释明示）：读锁快路径 + 写锁内复查，避免并发下重复 realize。
-- **限流只作用于 lazy/instant/cache 模式**（代码注释明示）：standard 模式建树期已算完，运行时无 realize 开销，不设限。
+- **内置实现的缓存同步**：读锁快路径 + 写锁内复查，避免并发下重复 realize；这属于具体实现机制，不是 `Tree` 接口向其他实现施加的锁策略。
+- **限流按节点自身模式执行**：原生 standard 节点初始建树时求值，挂载后仍可能因首次访问或父版本更新而重新求值；挂载不把它转换成其他模式，也不复制源限流器。
 - **builder panic 被 recover 包装**（`forest.appendBuilders`）：单个树构建失败不拖垮整个 forest 刷新（测试显式覆盖）。
 - **`CURLProcessError` 的诊断/脱敏双轨**（`curl.go` 注释）：`Error()` 里敏感头与 URL 密码打码、正文截断到 4KB，结构化字段保留原值给显式检查错误的调用方——可观测性与安全兼顾。
 - **序列化能力是 Processor 的可选属性**：`RawProcessor`/`CombinedProcessor` `Load` 恒败（`ErrSerializeNotSupport`），`GeneralModem` 拒绝接口类型参数 T——代码内变换与配置文件规则两个世界显式分离。
 - **web 管理面是占位**（`route.go` 注释）：只有 `GET /api/v1/rule` 完整实现，`template/info/mod/list/config` 均为 `Ping` 占位，引擎核心与 HTTP 面解耦推进。
 - **一处已实锤的配置键漂移（2026-08-31 诊断并修复）**：`conf/rules.json` 的键名曾是 `"operators"`，而 `serve.go:RuleDataItem` 的标签是 `json:"Processors"`——2023-10-18 提交 `8e60da4`（rename Operator to Processor）改了代码标签但漏改该默认文件，`encoding/json` 对不匹配键静默忽略，导致默认配置的 curl processor 在启动时被丢弃、`/` 路径挂空 directive（现有 `TestLoad` 只用自建 fixture，从未覆盖默认文件，因此逃过 CI）。已将 conf 键名修正为 `"Processors"`，并新增 `cmd/serve/rules_config_contract_test.go` 钉死默认文件必须解析出非空 processor 链，防止同类静默漂移复发。
 
-## 8. 硬性约束下的验证说明
+## 8. 验证边界
 
-本文档中出现的文件路径、类型、函数名均在仓库源码中逐一核对（`rg` 验证），未执行 `go build/test`，未修改除本文件外的任何文件。
+架构契约的验证应覆盖：公开路径的接收者局部语义、跨自定义树的后缀委派、直接对象引用、
+挂载别名与动态位置、解除归属后重新挂载、混合模式下父版本传播，以及 Forest builder 重建。
+并发测试针对具体树实现，不把内置锁机制当作所有 `Tree` 实现的接口保证；实际执行结果以
+当前变更的测试与 CI 记录为准。
