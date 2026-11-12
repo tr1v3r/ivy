@@ -47,19 +47,19 @@ retry:
 			root.topologyMu.Lock()
 		}
 
+		unlock := func() {
+			for _, root := range slices.Backward(roots) {
+				root.topologyMu.Unlock()
+			}
+		}
+
 		for _, node := range nodes {
 			if node != nil && !slices.Contains(roots, node.topologyRoot()) {
-				unlockTopologyRoots(roots)
+				unlock()
 				continue retry
 			}
 		}
 
-		return func() { unlockTopologyRoots(roots) }
-	}
-}
-
-func unlockTopologyRoots(roots []*tree) {
-	for i := len(roots) - 1; i >= 0; i-- {
-		roots[i].topologyMu.Unlock()
+		return unlock
 	}
 }
