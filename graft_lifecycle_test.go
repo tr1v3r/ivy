@@ -699,6 +699,63 @@ func TestGraft_PublicQueryPropagatesAncestorError(t *testing.T) {
 	}
 }
 
+func TestGraft_ConcurrentSetAdoptsPublishedBranch(t *testing.T) {
+	var setRuns atomic.Int32
+	root := graftTestTree(t, "standard", "ROOT")
+	root.topologyMu.Lock()
+	release := sync.OnceFunc(root.topologyMu.Unlock)
+	task := startTopologyTestTask(func() error {
+		return root.Set(NewDirective("/x/y", graftTestCountProc(&setRuns, "-xy")))
+	})
+	defer func() {
+		release()
+		if !task.collected {
+			if err, ok := task.await(t, "branch adoption cleanup"); ok && err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+	if !awaitGraftSignal(t, task.started, "Set contender started") {
+		return
+	}
+
+	// Publish while holding the structural domain. Set must adopt this node
+	// whether it already missed the lookup or observes it on the fast path;
+	// no sleep or claim that every run executes the late recheck is needed.
+	injected := root.newSubTree("x")
+	root.mu.Lock()
+	root.children["x"] = injected
+	root.mu.Unlock()
+	release()
+	if err, ok := task.await(t, "Set adopting the published branch"); !ok || err != nil {
+		t.Errorf("Set: %v", err)
+		return
+	}
+
+	if root.pickChild("x") != injected || injected.pickChild("y") == nil {
+		t.Fatal("Set replaced the published branch or lost its update")
+	}
+	graftTestGet(t, root, "/x/y", "ROOT-xy")
+	if setRuns.Load() != 2 {
+		t.Fatalf("processor runs = %d; want eager Set plus initial parent publication", setRuns.Load())
+	}
+}
+
+func TestGraft_DescentRejectsClearedChildMount(t *testing.T) {
+	root := graftTestTree(t, "standard", "R", NewDirective("/c", appendProc("-c")))
+	child := root.pickChild("c").(*tree)
+	// Unit isolation of a child selected just before replacement clears its
+	// old mount. Public Get must not be used on this deliberately stale map.
+	child.mount.Store(nil)
+	q := newPathQuery(root.driver, "/c")
+	if _, err := root.getWithParent(nil, 0, q, root.mount.Load()); !errors.Is(err, errMountChanged) {
+		t.Fatalf("plain descent error = %v; want mount change", err)
+	}
+	if _, err := root.getContextWithParent(nil, nil, 0, q, root.mount.Load()); !errors.Is(err, errMountChanged) {
+		t.Fatalf("context descent error = %v; want mount change", err)
+	}
+}
+
 func TestGraft_StaleCarryCannotPublishAfterRemount(t *testing.T) {
 	for _, contextual := range []bool{false, true} {
 		t.Run(map[bool]string{false: "Get", true: "GetWithContext"}[contextual], func(t *testing.T) {

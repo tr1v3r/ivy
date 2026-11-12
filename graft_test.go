@@ -748,6 +748,24 @@ func TestGraft_OwnershipCheckPrecedesCycleCheck(t *testing.T) {
 	}
 }
 
+func TestGraft_DeepInvalidNativeNameLeavesTreesUnchanged(t *testing.T) {
+	dst := graftTestTree(t, "standard", "D", NewDirective("/keep"))
+	source := graftTestTree(t, "lazy", "SOURCE", NewDirective("/mid//leaf", appendProc("-deep")))
+	beforeDst, beforeSource := string(dst.ShowStruct()), string(source.ShowStruct())
+	content, version := source.getWithVersion()
+
+	err := dst.Graft("/new/deep/mount", source)
+	if err == nil || !strings.Contains(err.Error(), "incompatible with enclosing path syntax") {
+		t.Fatalf("deep source name error = %v", err)
+	}
+
+	current, currentVersion := source.getWithVersion()
+	if string(dst.ShowStruct()) != beforeDst || string(source.ShowStruct()) != beforeSource ||
+		source.mount.Load() != nil || source.basePending.Load() || currentVersion != version || string(current) != string(content) {
+		t.Fatal("recursive source-name failure changed the trees or source publication")
+	}
+}
+
 func TestCycleCheck(t *testing.T) {
 	root := graftTestTree(t, "lazy", "ROOT", NewDirective("/child/leaf"))
 	child := root.pickChild("child").(*tree)
