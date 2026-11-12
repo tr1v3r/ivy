@@ -122,8 +122,11 @@ The `curl` processor owns its security posture explicitly:
 ### Direct subtree mounting and mixed modes
 
 Use `root.Graft(path, source)` to insert or replace an entire subtree at a
-non-root path whose parent already exists. The source is attached **directly**:
-there is no clone and no separate `GraftAt` function.
+non-root path. Missing native intermediate nodes are created automatically,
+using their parent's configuration without running processors. The source is
+attached **directly**: there is no clone and no separate `GraftAt` function.
+An existing custom `Tree` receives the remaining suffix and controls creation
+within its own subtree.
 
 ```go
 root, err := ivy.NewJSONTree[ivy.Directive]("cfg", `{"enabled":true}`)
@@ -134,7 +137,6 @@ branch, err := ivy.NewLazyJSONTree("branch", `{}`,
     ivy.NewDirective("/", &driver.JSONProcessor{
         T: "create", JSONPath: "region", V: []byte("beijing"),
     }),
-    ivy.NewDirective("/users"),
 )
 if err != nil {
     return err
@@ -158,6 +160,7 @@ live, err := ivy.NewLazyInstantJSONTree[ivy.Directive]("live-source", `{}`)
 if err != nil {
     return err
 }
+// The missing /api/users parent is created inside the mounted branch.
 if err := root.Graft("/api/users/live", live); err != nil {
     return err
 }

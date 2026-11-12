@@ -193,7 +193,7 @@ func TestGraft_NestedMountMovesToDifferentDepth(t *testing.T) {
 	}
 }
 
-func TestGraft_ConcurrentSetCreatesOneSharedBranch(t *testing.T) {
+func TestGraft_ConcurrentMutationsCreateOneSharedBranch(t *testing.T) {
 	dst := graftTestTree(t, "standard", "D")
 	source := graftTestTree(t, "standard", "SOURCE", NewDirective("/", appendProc("-s")))
 
@@ -202,6 +202,13 @@ func TestGraft_ConcurrentSetCreatesOneSharedBranch(t *testing.T) {
 	}
 
 	const workers = 32
+	sources := make([]Tree, workers)
+	for worker := range sources {
+		if worker%3 == 0 {
+			sources[worker] = graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc(fmt.Sprintf("-%d", worker))))
+		}
+	}
+
 	start := make(chan struct{})
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
@@ -221,7 +228,14 @@ func TestGraft_ConcurrentSetCreatesOneSharedBranch(t *testing.T) {
 
 			path := fmt.Sprintf("%sleaf-%d", prefix, worker)
 
-			if err := receiver.Set(NewDirective(path, appendProc(fmt.Sprintf("-%d", worker)))); err != nil {
+			var err error
+			if sources[worker] != nil {
+				err = receiver.Graft(path, sources[worker])
+			} else {
+				err = receiver.Set(NewDirective(path, appendProc(fmt.Sprintf("-%d", worker))))
+			}
+
+			if err != nil {
 				errs <- err
 			}
 		}()

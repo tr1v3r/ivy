@@ -636,7 +636,7 @@ func (t *tree) pickChild(name string) Tree {
 }
 
 // newSubTree creates a child with inherited configuration.
-func (t *tree) newSubTree(name string) Tree {
+func (t *tree) newSubTree(name string) *tree {
 	// one pair read pins (content, version) together: three separate
 	// locked reads could observe a parent set() in between and hand the
 	// child an inherited snapshot labeled with a version it never came

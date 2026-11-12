@@ -70,12 +70,12 @@ func TestGraft_NativeSourceKeepsDriverWithRootPathSyntax(t *testing.T) {
 
 	other := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-other")))
 
-	if err := dst.Graft("/parent/alias/leaf/other", other); err != nil {
+	if err := dst.Graft("/parent/alias/leaf/new/deep/other", other); err != nil {
 		t.Fatal(err)
 	}
 
-	graftTestGet(t, dst, "/parent/alias/leaf/other", "D-p-s-l-other")
-	if other.Path() != "/parent/alias/leaf/other" {
+	graftTestGet(t, dst, "/parent/alias/leaf/new/deep/other", "D-p-s-l-other")
+	if other.Path() != "/parent/alias/leaf/new/deep/other" {
 		t.Fatalf("Path did not use root syntax: %q", other.Path())
 	}
 }
@@ -89,29 +89,29 @@ func TestGraft_CustomRootParserControlsNativeTraversal(t *testing.T) {
 
 	source := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-s")), NewDirective("/leaf", appendProc("-l")))
 
-	if err := root.Graft(".parent.alias", source); err != nil {
+	if err := root.Graft(".parent.new.deep.alias", source); err != nil {
 		t.Fatal(err)
 	}
 
-	graftTestGet(t, root, ".parent.alias.leaf", "R-p-s-l")
-	if source.Path() != ".parent.alias" || source.pickChild("leaf").Path() != ".parent.alias.leaf" {
+	graftTestGet(t, root, ".parent.new.deep.alias.leaf", "R-p-s-l")
+	if source.Path() != ".parent.new.deep.alias" || source.pickChild("leaf").Path() != ".parent.new.deep.alias.leaf" {
 		t.Fatalf("mounted paths ignored root parser: %q/%q", source.Path(), source.pickChild("leaf").Path())
 	}
 
-	if err := root.Set(NewDirective(".parent.alias.added", appendProc("-a"))); err != nil {
+	if err := root.Set(NewDirective(".parent.new.deep.alias.added", appendProc("-a"))); err != nil {
 		t.Fatal(err)
 	}
 
-	graftTestGet(t, root, ".parent.alias.added", "R-p-s-a")
-	if !root.Has(".parent.alias.added") {
+	graftTestGet(t, root, ".parent.new.deep.alias.added", "R-p-s-a")
+	if !root.Has(".parent.new.deep.alias.added") {
 		t.Fatal("custom root Has did not consume local segments")
 	}
 
-	if err := root.Del(".parent.alias.added"); err != nil {
+	if err := root.Del(".parent.new.deep.alias.added"); err != nil {
 		t.Fatal(err)
 	}
 
-	if root.Has(".parent.alias.added") {
+	if root.Has(".parent.new.deep.alias.added") {
 		t.Fatal("custom root Del did not consume local segments")
 	}
 }
@@ -464,12 +464,14 @@ func TestGraft_NameValidationIsMountOnly(t *testing.T) {
 	root := graftTestTree(t, "standard", "D", NewDirective("/mount", appendProc("-old")))
 	old := root.pickChild("mount")
 
-	if err := root.Graft("/mount", bad); err == nil {
-		t.Fatal("accepted slash-containing source alias under a slash root")
+	for _, path := range []string{"/mount", "/new/deep/api"} {
+		if err := root.Graft(path, bad); err == nil {
+			t.Fatal("accepted slash-containing source alias under a slash root")
+		}
 	}
 
-	if root.pickChild("mount") != old || bad.Path() != "" {
-		t.Fatal("failed alias validation changed ownership or replaced old node")
+	if root.pickChild("mount") != old || bad.Path() != "" || root.Has("/new") || bad.(*tree).basePending.Load() {
+		t.Fatal("failed alias validation changed ownership, source state or destination prefixes")
 	}
 
 	graftTestGet(t, root, "/mount", "D-old")
@@ -481,6 +483,21 @@ func TestGraft_NameValidationIsMountOnly(t *testing.T) {
 
 	if err := root.Graft("/mount", good); err != nil {
 		t.Fatal(err)
+	}
+
+	for _, native := range []bool{false, true} {
+		source := graftDispatchSource(t, native)
+		if err := root.Graft("/mount/new/deep/a.b", source); err == nil {
+			t.Fatal("accepted a final alias incompatible with the mounted dot parser")
+		}
+
+		if root.Has("/mount/new") {
+			t.Fatal("rejected final alias published missing parents")
+		}
+
+		if nativeSource, ok := source.(*tree); ok && (nativeSource.mount.Load() != nil || nativeSource.basePending.Load() || nativeSource.realizedAt.IsZero()) {
+			t.Fatal("rejected final alias changed native source state")
+		}
 	}
 
 	for _, tc := range []struct {

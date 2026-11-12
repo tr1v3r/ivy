@@ -30,7 +30,7 @@ type treeMount struct {
 }
 
 // Graft directly attaches source at a local path, replacing the entire target
-// subtree. The parent must exist and the receiver root cannot be replaced.
+// subtree. Missing native parents are created; the receiver root cannot be replaced.
 // No tree is copied and no processors run during grafting. Native source caches
 // are invalidated so the next access composes from the new parent's content.
 func (t *tree) Graft(path string, source Tree) error {
@@ -120,10 +120,7 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 	unlock := lockTopologyRoots(t, source)
 	defer unlock()
 
-	targetTree, remainingQuery, err := t.locateGraftTarget(q)
-	if err != nil {
-		return nil, "", err
-	}
+	targetTree, remainingQuery := t.locateGraftTarget(q)
 
 	parent, isNativeTarget := targetTree.(*tree)
 	if !isNativeTarget {
@@ -139,7 +136,7 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 		return nil, "", fmt.Errorf("graft would create a cycle")
 	}
 
-	name := remainingQuery.head()
+	name := remainingQuery.name(remainingQuery.level())
 	if !validNativeName(parent, name) {
 		return nil, "", fmt.Errorf("graft name %q is incompatible with enclosing path syntax", name)
 	}
@@ -150,14 +147,15 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
+	mountParent := parent.createGraftParents(remainingQuery)
 	source.prepareForGraft()
 
-	if previousTree, ok := parent.children[name].(*tree); ok {
+	if previousTree, ok := mountParent.children[name].(*tree); ok {
 		previousTree.mount.Store(nil)
 	}
 
-	source.mount.Store(&treeMount{parent: parent, name: name})
-	parent.children[name] = source
+	mountParent.children[name] = source
+	source.mount.Store(&treeMount{parent: mountParent, name: name})
 
 	return nil, "", nil
 }
@@ -184,17 +182,14 @@ func (t *tree) graftTree(q pathQuery, source Tree) (Tree, string, error) {
 	unlock := lockTopologyRoots(t)
 	defer unlock()
 
-	targetTree, remainingQuery, err := t.locateGraftTarget(q)
-	if err != nil {
-		return nil, "", err
-	}
+	targetTree, remainingQuery := t.locateGraftTarget(q)
 
 	parent, isNativeTarget := targetTree.(*tree)
 	if !isNativeTarget {
 		return targetTree, remainingQuery.localPath(), nil
 	}
 
-	name := remainingQuery.head()
+	name := remainingQuery.name(remainingQuery.level())
 	if !validNativeName(parent, name) {
 		return nil, "", fmt.Errorf("graft name %q is incompatible with enclosing path syntax", name)
 	}
@@ -202,35 +197,51 @@ func (t *tree) graftTree(q pathQuery, source Tree) (Tree, string, error) {
 	parent.mu.Lock()
 	defer parent.mu.Unlock()
 
-	if previousTree, ok := parent.children[name].(*tree); ok {
+	mountParent := parent.createGraftParents(remainingQuery)
+	if previousTree, ok := mountParent.children[name].(*tree); ok {
 		previousTree.mount.Store(nil)
 	}
 
-	parent.children[name] = source
+	mountParent.children[name] = source
 
 	return nil, "", nil
 }
 
-// locateGraftTarget finds the native parent of the final edge, or the custom
-// target that must handle the remaining local query. It does not process source
-// state. Callers must hold the receiver's enclosing-root topology lock.
-func (t *tree) locateGraftTarget(q pathQuery) (Tree, pathQuery, error) {
+// locateGraftTarget follows existing native parents until the final edge, the
+// first missing edge, or a custom target. It does not mutate either tree.
+// Callers must hold the receiver's enclosing-root topology lock.
+func (t *tree) locateGraftTarget(q pathQuery) (Tree, pathQuery) {
 	parent := t
 	for !q.next().done() {
 		child := parent.pickChild(q.head())
 		if child == nil {
-			return nil, q, fmt.Errorf("graft parent at %q: %w", q.localPath(), ErrNotExistsTree)
+			return parent, q
 		}
 
 		q = q.next()
 		if nativeChild, ok := child.(*tree); ok {
 			parent = nativeChild
 		} else {
-			return child, q, nil
+			return child, q
 		}
 	}
 
-	return parent, q, nil
+	return parent, q
+}
+
+// createGraftParents fills the missing native chain after validation. Callers
+// hold t.mu and its topology root until the source is attached, so readers
+// cannot enter the new branch before it is complete.
+func (t *tree) createGraftParents(q pathQuery) *tree {
+	parent := t
+	for !q.next().done() {
+		child := parent.newSubTree(q.head())
+		parent.children[q.head()] = child
+		parent = child
+		q = q.next()
+	}
+
+	return parent
 }
 
 func nativeParsers(node *tree) []driver.PathParser {

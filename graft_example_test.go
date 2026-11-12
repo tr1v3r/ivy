@@ -17,7 +17,6 @@ func ExampleTree_Graft() {
 		ivy.NewDirective("/", &driver.JSONProcessor{
 			T: "create", JSONPath: "region", V: []byte("beijing"),
 		}),
-		ivy.NewDirective("/users"),
 	)
 	if err != nil {
 		panic(err)
@@ -36,7 +35,7 @@ func ExampleTree_Graft() {
 		panic(err)
 	}
 
-	// Continue operating from root, even inside a previously mounted source.
+	// Continue from root; the missing users parent is created inside branch.
 	if err := root.Graft("/api/users/live", live); err != nil {
 		panic(err)
 	}

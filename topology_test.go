@@ -304,13 +304,13 @@ func TestNativeTopology_CompetingTargetsHaveOneSourceOwner(t *testing.T) {
 		aTask := startTopologyTestTask(func() error {
 			<-start
 
-			return a.Graft("/slot", source)
+			return a.Graft("/x/y/slot", source)
 		})
 
 		bTask := startTopologyTestTask(func() error {
 			<-start
 
-			return b.Graft("/slot", source)
+			return b.Graft("/x/y/slot", source)
 		})
 
 		close(start)
@@ -329,8 +329,13 @@ func TestNativeTopology_CompetingTargetsHaveOneSourceOwner(t *testing.T) {
 			winner, loser = b, a
 		}
 
+		if !winner.Has("/x/y/slot/leaf") || loser.Has("/x") {
+			t.Fatal("winner lost the created path or rejected claim published a prefix")
+		}
+
+		parent := winner.pickChild("x").(*tree).pickChild("y").(*tree)
 		link := source.mount.Load()
-		if link == nil || link.parent != winner || link.name != "slot" || winner.pickChild("slot") != source || loser.Has("/slot") {
+		if link == nil || link.parent != parent || link.name != "slot" || parent.pickChild("slot") != source {
 			t.Fatal("source ownership disagrees with the single successful target")
 		}
 	}

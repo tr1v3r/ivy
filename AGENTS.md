@@ -81,7 +81,7 @@ Note: most web routes (`template`, `info`, `mod`, `list`, `config`) are currentl
 ### Direct Subtree Mounting
 
 - Public API: `Tree.Graft(path string, source Tree) error`; this is a breaking replacement for `Graft(Tree)`. Do not reintroduce a clone-based `GraftAt` function or require `Clone`.
-- The target path is receiver-local, must be non-root, and must have an existing parent. Its final segment is the mount alias; replacement is whole-subtree replacement, not a merge.
+- The target path is receiver-local and must be non-root. Missing native intermediate nodes are created without processors, inheriting the nearest parent's configuration as Set does. Its final segment is the mount alias; replacement is whole-subtree replacement, not a merge. Custom targets receive the remaining suffix and own its creation semantics.
 - Native mounting attaches the exact source object. Retained source references still edit the mounted object; source drivers, processors, modes, rate limiters and context objects are not copied or replaced.
 - A native source must be detached and single-parent. Reject self/cycle/duplicate ownership. Replacement and `Del` detach removed native subtrees so they can be remounted.
 - Invalidate source result caches for new parent inheritance, but retain its last base until access replaces it with the new parent content (including nil). Detaching before access preserves that prior base. Never execute processors in `Graft`, including standard processors. Mounted standard nodes wait for access and recompose when their parent publication changes.

@@ -79,12 +79,13 @@ type Tree interface {
 	Del(path string) error
 
 	// Graft directly attaches source at a path local to this tree root,
-	// replacing the entire target subtree. The parent must already exist;
-	// replacing the receiver root is not allowed. Source is not copied.
+	// replacing the entire target subtree. The native implementation creates
+	// missing intermediate native nodes without running processors.
+	// Replacing the receiver root is not allowed. Source is not copied.
 	// Implementations own positioning, inheritance, cache and concurrency
 	// behavior. For native sources, the native implementation requires
 	// detached ownership and invalidates caches without running processors.
-	// A nil source or missing parent wraps ErrNotExistsTree in that implementation.
+	// A nil source wraps ErrNotExistsTree in that implementation.
 	Graft(path string, source Tree) error
 
 	// ShowStruct returns the tree structure as JSON.

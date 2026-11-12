@@ -503,12 +503,11 @@ func TestGraft_RejectsInvalidPathsAndSources(t *testing.T) {
 	}{
 		{"root", "/", false},
 		{"empty", "", false},
-		{"missing_parent", "/missing/child", true},
-		{"nil_source", "/keep", true},
-		{"typed_nil_native", "/keep", true},
-		{"typed_nil_custom", "/keep", true},
-		{"nil_receiver", "/keep", true},
-		{"self", "/keep", false},
+		{"nil_source", "/new/deep/api", true},
+		{"typed_nil_native", "/new/deep/api", true},
+		{"typed_nil_custom", "/new/deep/api", true},
+		{"nil_receiver", "/new/deep/api", true},
+		{"self", "/new/deep/api", false},
 		{"ancestor_cycle", "/keep/cycle", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -539,11 +538,11 @@ func TestGraft_RejectsInvalidPathsAndSources(t *testing.T) {
 			}
 
 			if tc.missing && receiver != nil && errors.Unwrap(err) == nil {
-				t.Fatal("Graft discarded source/parent context instead of wrapping the sentinel")
+				t.Fatal("Graft discarded source context instead of wrapping the sentinel")
 			}
 
-			if dst.pickChild("keep") != old {
-				t.Fatal("invalid graft replaced an existing node")
+			if dst.pickChild("keep") != old || dst.Has("/new") {
+				t.Fatal("invalid graft replaced an existing node or published a missing prefix")
 			}
 
 			graftTestGet(t, dst, "/keep", "D-old")
@@ -613,26 +612,113 @@ func TestSet_PreservesParsedPathSegments(t *testing.T) {
 	}
 }
 
-func TestGraft_EmptySegmentUsesParentLookup(t *testing.T) {
+func TestGraft_CreatesMissingParents(t *testing.T) {
+	for _, mode := range []string{"standard", "lazy", "instant", "ttl"} {
+		for _, sourceKind := range []string{"native", "custom"} {
+			for _, path := range []string{"/x/y/z/api", "/kept/x/y/api"} {
+				t.Run(mode+"/"+sourceKind+path, func(t *testing.T) {
+					var parentRuns, sourceRuns atomic.Int32
+					root := graftTestTree(t, mode, "ROOT",
+						NewDirective("/", graftTestCountProc(&parentRuns, "-p")),
+						NewDirective("/kept", appendProc("-kept")), NewDirective("/keep"))
+					kept := root.pickChild("kept").(*tree)
+					kept.SetDefaultContext(&driver.RealizeContext{Context: context.Background()})
+					kept.SetFallback(appendProc("-fallback"))
+					sibling := root.pickChild("keep")
+
+					var source Tree
+					if sourceKind == "native" {
+						source = graftTestTree(t, "standard", "SOURCE",
+							NewDirective("/", graftTestCountProc(&sourceRuns, "-s")), NewDirective("/leaf", appendProc("-leaf")))
+						graftTestGet(t, source, "/leaf", "SOURCE-s-leaf")
+						sourceRuns.Store(0)
+					} else {
+						source = newGraftTestForeignTree()
+					}
+
+					before := parentRuns.Load()
+					if err := root.Graft(path, source); err != nil {
+						t.Fatal(err)
+					}
+
+					if parentRuns.Load() != before || sourceRuns.Load() != 0 {
+						t.Fatal("Graft ran processors while filling missing parents")
+					}
+
+					parent := root
+					segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
+					for _, name := range segments[:len(segments)-1] {
+						child, ok := parent.pickChild(name).(*tree)
+						if !ok {
+							t.Fatalf("missing native parent %q", name)
+						}
+
+						if child != kept && (child.driver != parent.driver || child.lazyMode != parent.lazyMode ||
+							child.instantMode != parent.instantMode || child.cacheTTL != parent.cacheTTL ||
+							child.defaultCtx.Load() != parent.defaultCtx.Load() || child.fallback.Load() != parent.fallback.Load() ||
+							len(child.procs) != 0 || !child.realizedAt.IsZero()) {
+							t.Fatal("created parent did not inherit configuration without realization")
+						}
+
+						parent = child
+					}
+
+					if parent.pickChild("api") != source || root.pickChild("kept") != kept || root.pickChild("keep") != sibling {
+						t.Fatal("Graft copied the source or replaced existing parents/siblings")
+					}
+
+					if native, ok := source.(*tree); ok {
+						if native.Path() != path || native.pickChild("leaf").Path() != path+"/leaf" {
+							t.Fatal("source paths do not include created parents")
+						}
+
+						want := "ROOT-p"
+						if strings.HasPrefix(path, "/kept/") {
+							want += "-kept"
+						}
+						graftTestGet(t, root, path+"/leaf", want+"-s-leaf")
+					} else {
+						if len(source.(*graftTestForeignTree).calls) != 0 {
+							t.Fatal("Graft called the custom source while creating parents")
+						}
+
+						graftTestGet(t, root, path+"/leaf", "foreign:/leaf")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGraft_CreatesParentsWithParsedSegments(t *testing.T) {
 	for _, sourceKind := range []string{"native", "custom"} {
-		t.Run(sourceKind, func(t *testing.T) {
-			root := graftTestTree(t, "standard", "ROOT", NewDirective("/a/b", appendProc("-keep")))
-			source := graftDispatchSource(t, sourceKind == "native")
-			parent := root.pickChild("a").(*tree)
-			previous := parent.pickChild("b")
+		for _, path := range []string{"/a//b", "/new//b", "/new/ /b"} {
+			t.Run(sourceKind+path, func(t *testing.T) {
+				root := graftTestTree(t, "standard", "ROOT", NewDirective("/a/b", appendProc("-keep")))
+				source := graftDispatchSource(t, sourceKind == "native")
+				parent := root.pickChild("a").(*tree)
+				previous := parent.pickChild("b")
 
-			err := root.Graft("/a//b", source)
+				if err := root.Graft(path, source); err != nil {
+					t.Fatal(err)
+				}
 
-			if !errors.Is(err, ErrNotExistsTree) {
-				t.Fatalf("Graft error = %v; want missing empty-named parent", err)
-			}
+				if !root.Has(path) || parent.pickChild("b") != previous {
+					t.Fatal("Graft discarded a parsed segment or replaced /a/b")
+				}
 
-			if parent.pickChild("") != nil || parent.pickChild("b") != previous {
-				t.Fatal("failed lookup created an empty parent or skipped it to replace /a/b")
-			}
+				want := "foreign:/leaf"
+				if native, ok := source.(*tree); ok {
+					want = "ROOT-source"
+					if native.Path() != path {
+						t.Fatalf("source path = %q; want %q", native.Path(), path)
+					}
+				}
 
-			graftTestGet(t, root, "/a/b", "ROOT-keep")
-		})
+				graftTestGet(t, root, path+"/leaf", want)
+				graftTestGet(t, root, "/a/b", "ROOT-keep")
+			})
+		}
 	}
 }
 

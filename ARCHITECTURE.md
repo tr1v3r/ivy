@@ -136,7 +136,8 @@ type ParamAware interface { ParamKeys() []string }
 ### 3.4 直接挂接与局部路径递归（`Tree.Graft`）
 
 `root.Graft("/api/config", source)` 直接把 **source 本身** 挂到指定位置，
-不复制对象。目标父节点 `/api` 必须存在，目标不能是接收者的根；原目标子树整体替换。
+不复制对象。缺失的原生中间节点（如 `/api`）会自动补齐，沿用父节点配置且不执行处理器；
+目标不能是接收者的根，原目标子树整体替换。
 `source.Name()` 可以与别名 `config` 不同，原生 `source.Path()` 根据新父链返回
 `/api/config`。继续执行 `root.Graft("/api/config/live", other)` 会进入已经挂载的树。
 
@@ -148,8 +149,8 @@ type ParamAware interface { ParamKeys() []string }
 ```text
 【局部寻址：入口解析一次，cursor 逐段消费】
 root.Graft("/api/config/live", source)
-│ root   剩余 api/config/live → 找到 api
-│ api    剩余 config/live     → 找到 config（可能是此前挂载的树）
+│ root   剩余 api/config/live → 找到 api，缺失则在现有父节点写锁内补齐原生父链
+│ api    剩余 config/live     → 找到或创建 config（可能是此前挂载的树）
 └─ config 剩余 live           → 替换 children["live"]
    └─ 遇到自定义 Tree → 公开方法只接收剩余后缀字符串，不传原始整树路径
 
@@ -158,6 +159,7 @@ root.Graft("/api/config/live", source)
 │ 保留同一源对象及其 Driver / Processor / 模式 / 限流器 / 上下文对象
 │ 记录 parent + mount alias，不递归写入绝对 path / level
 │ 失效源的求值状态与结果缓存；保留旧基底，首次读取时由新父内容覆盖（包括 nil）
+│ 校验后在最近现有父节点的写锁内补齐父链，接上 source 后解锁发布
 └─ 替换目标引用；被替换的原生子树解除归属，Del 同样解除归属
    └─ 脱离父节点后的子树可重新挂载到其他位置
 
