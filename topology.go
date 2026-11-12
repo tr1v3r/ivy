@@ -2,8 +2,8 @@ package ivy
 
 import (
 	"cmp"
-	"reflect"
 	"slices"
+	"unsafe"
 )
 
 func (t *tree) topologyRoot() *tree {
@@ -40,7 +40,7 @@ retry:
 		}
 
 		slices.SortFunc(roots, func(a, b *tree) int {
-			return cmp.Compare(reflect.ValueOf(a).Pointer(), reflect.ValueOf(b).Pointer())
+			return cmp.Compare(uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(b)))
 		})
 
 		for _, root := range roots {
