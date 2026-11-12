@@ -51,12 +51,15 @@ type Forest interface {
 	SetDefaultContext(rc *driver.RealizeContext)
 }
 
-// Tree is a hierarchical node structure with path-based access.
+// Tree is a hierarchical node structure with path-based access. All operation
+// paths are local to the receiver root (a leading delimiter does not make them
+// global). Each implementation is responsible for its own concurrency safety.
 type Tree interface {
 	// Name returns the tree name.
 	Name() string
-	// Path returns the tree path in the root tree.
-	// Returns "" when the tree is the root tree.
+	// Path returns the effective mount location in the enclosing tree.
+	// Returns "" for an unattached root. Operation paths are local to the
+	// receiver root, even when Path reports a nonempty mount location.
 	Path() string
 
 	// Set adds or updates a directive on the tree.
@@ -71,10 +74,13 @@ type Tree interface {
 	// Del deletes a node at the given path.
 	Del(path string) error
 
-	// Graft attaches a child reference by name without rebasing paths,
-	// levels or caches. It is a low-level operation for already positioned
-	// nodes; use GraftAt for independently constructed or mixed-mode trees.
-	Graft(Tree)
+	// Graft directly attaches source at a path local to this tree root,
+	// replacing the entire target subtree. The parent must already exist;
+	// replacing the receiver root is not allowed. Source is not copied.
+	// Implementations own positioning, inheritance, cache and concurrency
+	// behavior. For native sources, the native implementation requires
+	// detached ownership and invalidates caches without running processors.
+	Graft(path string, source Tree) error
 
 	// ShowStruct returns the tree structure as JSON.
 	ShowStruct() []byte

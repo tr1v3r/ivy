@@ -1,94 +1,206 @@
 package ivy
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
-
-	"github.com/tr1v3r/ivy/driver"
 )
 
-func TestGraftAt_ParentRefreshDuringPreparation(t *testing.T) {
+func TestGraft_ParentUpdateBeforeFirstMountedQuery(t *testing.T) {
 	dst := graftTestTree(t, "standard", "D", NewDirective("/", appendProc("-old")))
-	started, release := make(chan struct{}), make(chan struct{})
-	var active atomic.Bool
-	var startedOnce, releaseOnce sync.Once
-	unblock := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(unblock)
-	src := graftTestTree(t, "standard", "SOURCE", NewDirective("/", &driver.RawProcessor{
-		Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
-			if active.Load() {
-				startedOnce.Do(func() { close(started) })
-				<-release
-			}
-			return appendProc("-s").Process(rc, before)
-		},
-	}))
-	active.Store(true)
-	done := make(chan error, 1)
-	go func() { done <- GraftAt(dst, "/mount", src) }()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("graft preparation did not start")
+	var runs atomic.Int32
+	src := graftTestTree(t, "standard", "SOURCE",
+		NewDirective("/", graftTestCountProc(&runs, "-s")),
+		NewDirective("/leaf", appendProc("-l")))
+	graftTestGet(t, src, "/leaf", "SOURCE-s-l")
+	runs.Store(0)
+	if err := dst.Graft("/mount", src); err != nil {
+		t.Fatal(err)
 	}
-	// Updating an existing directive does not change topology. Publication
-	// can advance while the complete replacement is prepared off-tree.
+	if runs.Load() != 0 {
+		t.Fatal("standard source ran during Graft")
+	}
 	if err := dst.Set(NewDirective("/", appendProc("-new"))); err != nil {
 		t.Fatal(err)
 	}
-	unblock()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	graftTestGet(t, dst, "/mount", "D-new-s")
-	// Set must retain the refreshed pre-processor base, not the old mount
-	// snapshot or the node's previous output.
+	graftTestGet(t, dst, "/mount/leaf", "D-new-s-l")
 	if err := dst.Set(NewDirective("/mount", appendProc("-changed"))); err != nil {
 		t.Fatal(err)
 	}
-	graftTestGet(t, dst, "/mount", "D-new-changed")
+	graftTestGet(t, dst, "/mount/leaf", "D-new-changed-l")
 }
 
-func TestGraftAt_CopyAlreadyMixedSubtree(t *testing.T) {
+func TestGraft_NestedMountMovesToDifferentDepth(t *testing.T) {
 	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", appendProc("-lazy")))
 	standard := graftTestTree(t, "standard", "IGNORED", NewDirective("/", appendProc("-standard")))
-	if err := GraftAt(src, "/branch", standard); err != nil {
+	if err := src.Graft("/branch", standard); err != nil {
 		t.Fatal(err)
 	}
-	dst := graftTestTree(t, "standard", "D")
-	if err := GraftAt(dst, "/mount", src); err != nil {
+	leaf := graftTestTree(t, "instant", "IGNORED", NewDirective("/", appendProc("-live")))
+	if err := src.Graft("/branch/live", leaf); err != nil {
 		t.Fatal(err)
 	}
-	instant := graftTestTree(t, "instant", "IGNORED", NewDirective("/", appendProc("-instant")))
-	if err := GraftAt(dst, "/mount/branch/live", instant); err != nil {
+	a := graftTestTree(t, "standard", "A")
+	if err := a.Graft("/mount", src); err != nil {
 		t.Fatal(err)
+	}
+	graftTestGet(t, a, "/mount/branch/live", "A-lazy-standard-live")
+	if leaf.Path() != "/mount/branch/live" {
+		t.Fatalf("initial nested Path = %q", leaf.Path())
+	}
+	if err := a.Del("/mount"); err != nil {
+		t.Fatal(err)
+	}
+	if src.Path() != "" || leaf.Path() != "/branch/live" {
+		t.Fatalf("detached positions = %q/%q", src.Path(), leaf.Path())
+	}
+	b := graftTestTree(t, "standard", "B",
+		NewDirective("/a", appendProc("-a")), NewDirective("/a/b", appendProc("-b")))
+	if err := b.Graft("/a/b/alias", src); err != nil {
+		t.Fatal(err)
+	}
+	if src.Path() != "/a/b/alias" || standard.Path() != "/a/b/alias/branch" || leaf.Path() != "/a/b/alias/branch/live" {
+		t.Fatalf("remounted dynamic positions = %q/%q/%q", src.Path(), standard.Path(), leaf.Path())
 	}
 	for i := 0; i < 3; i++ {
-		graftTestGet(t, dst, "/mount/branch/live", "D-lazy-standard-instant")
+		graftTestGet(t, b, "/a/b/alias/branch/live", "B-a-b-lazy-standard-live")
 	}
-	graftTestGet(t, src, "/branch", "SOURCE-lazy-standard")
-	if src.Has("/branch/live") {
-		t.Fatal("editing copied mixed subtree changed source topology")
+	other := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-other")))
+	if err := b.Graft("/a/b/alias/branch/live/other", other); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, b, "/a/b/alias/branch/live/other", "B-a-b-lazy-standard-live-other")
+	if standard.pickChild("live") != leaf || leaf.pickChild("other") != other {
+		t.Fatal("moving a mixed subtree copied or lost nested mounted nodes")
 	}
 }
 
-func TestGraftAt_RejectsUnrepresentableNames(t *testing.T) {
-	dst := graftTestTree(t, "standard", "D")
-	src := graftTestTree(t, "lazy", "SOURCE")
-	if err := GraftAt(dst, "/a//b", src); err == nil {
-		t.Fatal("accepted an empty path segment")
-	}
-	parser := &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")}
-	withSlash, err := NewLazyTree(parser, "source", "SOURCE", NewDirective(".a/b", appendProc("-s")))
-	if err != nil {
+func TestGraft_ReplacementDetachesOldNativeSubtree(t *testing.T) {
+	a := graftTestTree(t, "standard", "A")
+	old := graftTestTree(t, "lazy", "OLD", NewDirective("/", appendProc("-old")), NewDirective("/leaf"))
+	if err := a.Graft("/slot", old); err != nil {
 		t.Fatal(err)
 	}
-	if err := GraftAt(dst, "/mount", withSlash); err == nil {
-		t.Fatal("accepted a child name that splits under destination parser")
+	graftTestGet(t, a, "/slot/leaf", "A-old")
+	replacement := graftTestTree(t, "lazy", "NEW", NewDirective("/", appendProc("-new")))
+	if err := a.Graft("/slot", replacement); err != nil {
+		t.Fatal(err)
 	}
-	if dst.Has("/mount") {
-		t.Fatal("invalid source was partially published")
+	if old.Path() != "" || replacement.Path() != "/slot" {
+		t.Fatalf("replacement did not update ownership: old=%q new=%q", old.Path(), replacement.Path())
+	}
+	b := graftTestTree(t, "standard", "B")
+	if err := b.Graft("/reused", old); err != nil {
+		t.Fatalf("detached subtree could not be remounted: %v", err)
+	}
+	graftTestGet(t, a, "/slot", "A-new")
+	graftTestGet(t, b, "/reused/leaf", "B-old")
+	if err := b.Del("/reused/leaf"); err != nil {
+		t.Fatal(err)
+	}
+	if old.Has("/leaf") {
+		t.Fatal("remounted source no longer shared identity with destination")
+	}
+}
+
+func TestGraft_ConcurrentSetCreatesOneSharedBranch(t *testing.T) {
+	dst := graftTestTree(t, "standard", "D")
+	source := graftTestTree(t, "standard", "SOURCE", NewDirective("/", appendProc("-s")))
+	if err := dst.Graft("/mount", source); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 32
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			// Both the outer root and retained source handle must create nodes
+			// in the same shared branch, rather than replacing each other's map.
+			receiver, prefix := Tree(dst), "/mount/shared/"
+			if worker%2 == 1 {
+				receiver, prefix = source, "/shared/"
+			}
+			path := fmt.Sprintf("%sleaf-%d", prefix, worker)
+			if err := receiver.Set(NewDirective(path, appendProc(fmt.Sprintf("-%d", worker)))); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	for worker := 0; worker < workers; worker++ {
+		path := fmt.Sprintf("/mount/shared/leaf-%d", worker)
+		if !dst.Has(path) {
+			t.Errorf("concurrent creation lost %s", path)
+			continue
+		}
+		graftTestGet(t, dst, path, fmt.Sprintf("D-s-%d", worker))
+	}
+}
+
+func TestGraft_ConcurrentReplacementAndReads(t *testing.T) {
+	dst := graftTestTree(t, "standard", "D")
+	const replacements = 100
+	sources := make([]*tree, replacements+1)
+	for i := range sources {
+		rootSuffix, leafSuffix := "-A", "-a"
+		if i%2 == 1 {
+			rootSuffix, leafSuffix = "-B", "-b"
+		}
+		sources[i] = graftTestTree(t, "lazy", "IGNORED",
+			NewDirective("/", appendProc(rootSuffix)), NewDirective("/leaf", appendProc(leafSuffix)))
+	}
+	if err := dst.Graft("/mount", sources[0]); err != nil {
+		t.Fatal(err)
+	}
+	const readers = 4
+	start := make(chan struct{})
+	errs := make(chan error, readers+1)
+	var wg sync.WaitGroup
+	for worker := 0; worker < readers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 300; i++ {
+				got, err := dst.Get("/mount/leaf")
+				if err != nil {
+					errs <- fmt.Errorf("replacement read failed: %w", err)
+					return
+				}
+				if string(got) != "D-A-a" && string(got) != "D-B-b" {
+					errs <- fmt.Errorf("read observed incomplete replacement: %q", got)
+					return
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for _, src := range sources[1:] {
+			// Each source is used exactly once: no concurrent ownership transfer
+			// or accidental remount of a source still attached elsewhere.
+			if err := dst.Graft("/mount", src); err != nil {
+				errs <- fmt.Errorf("replacement failed: %w", err)
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

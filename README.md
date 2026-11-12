@@ -113,17 +113,17 @@ The `curl` processor owns its security posture explicitly:
 | Factory | Mode | Behavior |
 |---|---|---|
 | `NewJSONTree` | standard | static prefix computed at build time |
-| `NewLazyJSONTree` | lazy | nodes created and realized on access |
+| `NewLazyJSONTree` | lazy | static content realized on first access |
 | `NewLazyInstantJSONTree` | instant | recompute on every access |
 | `NewLazyCacheJSONTree` | cache TTL | lazy semantics with expiry-based recompute |
 
 (Same variants exist for YAML, TOML, XML, and Tile drivers.)
 
-### Mixing modes within a tree
+### Direct subtree mounting and mixed modes
 
-Use `ivy.GraftAt(destination, path, source)` to insert or replace an entire
-subtree at any non-root path whose parent already exists. Pass the destination
-root tree (not an internal node) as `destination`:
+Use `root.Graft(path, source)` to insert or replace an entire subtree at a
+non-root path whose parent already exists. The source is attached **directly**:
+there is no clone and no separate `GraftAt` function.
 
 ```go
 root, err := ivy.NewJSONTree[ivy.Directive]("cfg", `{"enabled":true}`)
@@ -134,42 +134,81 @@ branch, err := ivy.NewLazyJSONTree("branch", `{}`,
     ivy.NewDirective("/", &driver.JSONProcessor{
         T: "create", JSONPath: "region", V: []byte("beijing"),
     }),
+    ivy.NewDirective("/users"),
 )
 if err != nil {
     return err
 }
-if err := ivy.GraftAt(root, "/api", branch); err != nil {
+if err := root.Graft("/api", branch); err != nil {
     return err
 }
 value, err := root.Get("/api") // {"enabled":true,"region":"beijing"}
 ```
 
-- The copied root takes the target name; all descendants get new paths and
-  levels. Existing descendants at the target are replaced, not merged.
-- Each copied node retains its own standard/lazy/instant/TTL mode. Standard
-  nodes are computed at graft time only if every ancestor is standard; below
-  a deferred ancestor they wait for access. Parent refreshes invalidate child
-  caches even when a child is standard or has a longer TTL.
-- Source templates and cached results are **not** mounted: content flows from
-  the destination parent. The source tree remains unchanged and can be reused;
-  topology, caches and rate limiters are independent.
-- Drivers' realizers/modems, processor objects and default-context objects are
-  shared with the source; keep their configuration immutable during use. The
-  destination path syntax applies throughout the mounted branch. Matching
-  content formats (or providing an explicit conversion processor) is the
-  caller's responsibility.
-- Fallbacks, default contexts and rate-limit settings are copied from the
-  source. Parameter-aware processors remain per-query and never enter caches.
-- Both trees and all source descendants must be native ivy trees. Invalid
-  paths, missing parents, cycles and eager processor failures return errors
-  without replacing the old subtree; processor external side effects cannot
-  be undone. Deferred processor errors surface on access.
-- Concurrent queries see either the old subtree or its complete replacement.
-  Serialize structural writers (`GraftAt`, raw `Graft`, `Del`, and `Set` that
-  creates nodes); copying a source is not a transaction across source edits.
+The target name is the mount alias (`api`), not `source.Name()` (`branch`).
+For native trees, `branch.Path()` now returns `/api`; `ShowStruct()` uses mount
+aliases as keys. `branch` is still the same object: editing it affects the
+mounted branch, rather than a private copy.
 
-The existing `Tree.Graft` is only a low-level reference insertion: it does not
-rebase independently constructed trees. Prefer `GraftAt` for composition.
+Keep subsequent operations root-oriented, including mounting below a branch
+that was itself mounted earlier:
+
+```go
+live, err := ivy.NewLazyInstantJSONTree[ivy.Directive]("live-source", `{}`)
+if err != nil {
+    return err
+}
+if err := root.Graft("/api/users/live", live); err != nil {
+    return err
+}
+value, err = root.Get("/api/users/live")
+```
+
+All public path-taking calls are **local to the receiver's tree root**, even
+when the path begins with `/`. For example, `branch.Has("/users/live")` examines
+the same node as `root.Has("/api/users/live")`; it does not interpret `/users`
+as a path from the outer root. Native traversal parses once and consumes path
+segments. When it delegates to a custom `Tree`, the public method receives the
+remaining suffix string, not the original whole-tree query.
+
+Native mounting has these semantics:
+
+- Existing descendants at the target are replaced, not merged. The source
+  must be detached and may have only one parent; self-mounts, cycles and
+  duplicate ownership are rejected. Replacement and `Del` detach the removed
+  native subtree so it can be mounted again elsewhere.
+- Every source node keeps its own driver, processors, evaluation mode, rate
+  limiter and context objects. These are the same objects, not copies.
+  Matching content formats (or an explicit conversion processor) is the
+  caller's responsibility. Native node aliases must also be representable in
+  every enclosing native path grammar; incompatible names are rejected rather
+  than creating nodes that root or retained-handle queries cannot address.
+- Mounting invalidates the source subtree's cached template/results for its
+  new inheritance. Content now flows from the destination parent.
+  **`Graft` never executes processors**, even for standard nodes. Mounted
+  standard nodes first re-evaluate on access and recompose when the parent
+  publication changes; lazy, instant and TTL modes retain their own caching
+  behavior. Parameter-aware output remains per-query, never cached.
+- Native positions derive dynamically from parent/mount-alias links rather
+  than a stored absolute level. Moving a detached subtree therefore does not
+  require rewriting every descendant's absolute path.
+
+The `Tree` interface does not prescribe a locking policy. Each implementation
+owns its concurrency guarantees; do not assume native inheritance or position
+tracking applies to arbitrary custom implementations. Public source references
+remain aliases to the attached object, so coordinate edits according to that
+implementation's contract. Native retained-handle reads resolve ancestor static
+content too, including on the first read after mounting or an ancestor refresh.
+Native realization is not reentrant: do not transfer a detached source from
+inside a processor currently realizing that same source.
+
+`Forest.Refresh` / `RefreshTree` rebuild trees through their `TreeBuilder`;
+put the mounting steps in the builder to recreate the same composition on
+refresh. Runtime mounts are not automatically replayed onto a newly built tree.
+
+**Breaking API change:** `Graft(Tree)` is now
+`Graft(path string, source Tree) error`. Callers must provide a target path and
+check the error; custom `Tree` implementations must update their method.
 
 ## Development
 

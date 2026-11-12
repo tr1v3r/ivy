@@ -28,7 +28,9 @@ Public API interfaces are defined in `export.go` (engine) and `driver/export.go`
 
 ### Content Flow
 
-`Get(path)` traverses the tree from root to target node. Each node realizes its content by applying its processor chain, then passes the content down to children (inheritance). Modes control when realization happens:
+All public path-taking methods use paths local to the receiver's tree root; prefer operating from the outer root. Native traversal parses once and advances a cursor through segments rather than relying on a node's stored absolute level. Calls into a custom `Tree` receive only the remaining suffix string, not the original whole-tree query.
+
+`Get(path)` traverses from that local root to the target node. Each native node realizes its static processor prefix, then carries its content and publication version to its children. `Path()` derives the native mounted position dynamically from parent/mount-alias links; `ShowStruct()` uses those aliases, not source `Name()` values.
 
 ## Development Commands
 
@@ -71,10 +73,21 @@ Note: most web routes (`template`, `info`, `mod`, `list`, `config`) are currentl
 
 ### Tree Modes
 
-- **Standard Mode**: Full tree built during initialization
-- **Lazy Mode**: Nodes are created and calculated only when accessed
+- **Standard Mode**: Static prefixes are evaluated during initial construction; after mounting they re-evaluate on first access and on parent publication changes
+- **Lazy Mode**: Static content is calculated on first access; directives may establish topology earlier
 - **Instant Mode**: Nodes are recalculated on every access for real-time data
 - **Cache TTL Mode**: Lazy with time-based cache expiration
+
+### Direct Subtree Mounting
+
+- Public API: `Tree.Graft(path string, source Tree) error`; this is a breaking replacement for `Graft(Tree)`. Do not reintroduce a clone-based `GraftAt` function or require `Clone`.
+- The target path is receiver-local, must be non-root, and must have an existing parent. Its final segment is the mount alias; replacement is whole-subtree replacement, not a merge.
+- Native mounting attaches the exact source object. Retained source references still edit the mounted object; source drivers, processors, modes, rate limiters and context objects are not copied or replaced.
+- A native source must be detached and single-parent. Reject self/cycle/duplicate ownership. Replacement and `Del` detach removed native subtrees so they can be remounted.
+- Invalidate source template/results caches for new parent inheritance, but never execute processors in `Graft`, including standard processors. Mounted standard nodes wait for access and recompose when their parent publication changes.
+- Preserve source modes independently. Parameter-aware processors remain target-only and never enter the static cache.
+- Do not assume arbitrary custom implementations provide native inheritance or position tracking. Each implementation controls its own semantics/concurrency; the `Tree` interface imposes no lock policy.
+- Forest refresh reruns builders and replaces trees. Recreate source trees and mounting steps inside `TreeBuilder` when composition must survive refresh.
 
 ### Driver System
 
@@ -178,4 +191,5 @@ Directives are defined in JSON format:
 
 - Modify `tree.go` for new tree operations
 - Update `export.go` interfaces if API changes are needed
-- Ensure thread safety with appropriate mutex usage (note the read/write lock double-check pattern in `realizeWithContext`)
+- Keep concurrency guarantees in the concrete implementation; the `Tree` interface must not prescribe locks. Native changes still need tests for their own topology/caching safety.
+- Preserve receiver-local path traversal, suffix delegation at custom-tree boundaries, direct source identity and detach/remount ownership; do not restore absolute-level routing.

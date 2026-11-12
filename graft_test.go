@@ -2,9 +2,9 @@ package ivy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,107 +58,69 @@ func graftTestExpire(tr *tree) {
 	tr.realizeMu.Unlock()
 }
 
-func TestGraftAt_RebaseAndReplace(t *testing.T) {
-	for _, tc := range []struct {
-		name, path, want string
-	}{
-		{"new_direct_child", "/new", "D-s-l-t"},
-		{"replace_direct_child", "/old", "D-s-l-t"},
-		{"replace_deep_child", "/parent/old", "D-p-s-l-t"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dst := graftTestTree(t, "standard", "D",
-				NewDirective("/old/stale", appendProc("-old")),
-				NewDirective("/parent", appendProc("-p")),
-				NewDirective("/parent/old/stale", appendProc("-old")),
-			)
-			src := graftTestTree(t, "lazy", "SOURCE",
-				NewDirective("/", appendProc("-s")),
-				NewDirective("/leaf", appendProc("-l")),
-				NewDirective("/leaf/tip", appendProc("-t")),
-			)
-			graftTestGet(t, src, "/leaf/tip", "SOURCE-s-l-t")
-			if err := GraftAt(dst, tc.path, src); err != nil {
-				t.Fatal(err)
-			}
-			graftTestGet(t, dst, tc.path+"/leaf/tip", tc.want)
-			if dst.Has(tc.path + "/stale") {
-				t.Fatal("replacement retained a prior descendant")
-			}
-			// Every level must be rebased, not only the mounted root.
-			q := newPathQuery(dst.driver, tc.path+"/leaf/tip")
-			node := dst
-			for level := 1; level <= q.level(); level++ {
-				child, ok := node.pickChild(q.name(level)).(*tree)
-				if !ok {
-					t.Fatalf("missing native child at level %d", level)
-				}
-				wantPath := node.driver.AppendPath(node.Path(), q.name(level))
-				if child.level != level || child.Path() != wantPath {
-					t.Fatalf("child metadata = (%q, %d); want (%q, %d)", child.Path(), child.level, wantPath, level)
-				}
-				node = child
-			}
-			if err := dst.Set(NewDirective(tc.path+"/added", appendProc("-added"))); err != nil {
-				t.Fatal(err)
-			}
-			if !dst.Has(tc.path + "/added") {
-				t.Fatal("Set did not use rebased destination levels")
-			}
-			parentResult := "D-s"
-			if tc.path == "/parent/old" {
-				parentResult = "D-p-s"
-			}
-			graftTestGet(t, dst, tc.path+"/added", parentResult+"-added")
-			if err := dst.Del(tc.path + "/leaf/tip"); err != nil {
-				t.Fatal(err)
-			}
-			if dst.Has(tc.path + "/leaf/tip") {
-				t.Fatal("Del did not use rebased destination levels")
-			}
-			if src.Path() != "" || src.level != 0 || src.Has("/added") {
-				t.Fatal("mount or destination Set modified the source topology")
-			}
-			graftTestGet(t, src, "/leaf/tip", "SOURCE-s-l-t")
-		})
+func TestGraft_DirectIdentityAliasAndLocalOperations(t *testing.T) {
+	dst := graftTestTree(t, "standard", "D",
+		NewDirective("/parent", appendProc("-p")),
+		NewDirective("/parent/alias/stale", appendProc("-old")))
+	src := graftTestTree(t, "lazy", "SOURCE",
+		NewDirective("/", appendProc("-s")),
+		NewDirective("/leaf", appendProc("-l")),
+		NewDirective("/leaf/tip", appendProc("-t")))
+	leaf := src.pickChild("leaf")
+	graftTestGet(t, src, "/leaf/tip", "SOURCE-s-l-t")
+	if err := dst.Graft("/parent/alias", src); err != nil {
+		t.Fatal(err)
+	}
+	parent := dst.pickChild("parent").(*tree)
+	if parent.pickChild("alias") != src || src.pickChild("leaf") != leaf {
+		t.Fatal("Graft copied source nodes rather than attaching the same objects")
+	}
+	if src.Name() != "test" || src.Path() != "/parent/alias" || leaf.Path() != "/parent/alias/leaf" {
+		t.Fatalf("identity/path mismatch: name=%q source=%q leaf=%q", src.Name(), src.Path(), leaf.Path())
+	}
+	graftTestGet(t, dst, "/parent/alias/leaf/tip", "D-p-s-l-t")
+	graftTestGet(t, src, "/leaf/tip", "D-p-s-l-t")
+	if dst.Has("/parent/alias/stale") {
+		t.Fatal("replacement retained an old descendant")
+	}
+	var shape map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(dst.ShowStruct(), &shape); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := shape["parent"]["alias"]; !ok {
+		t.Fatalf("ShowStruct does not use mount alias: %s", dst.ShowStruct())
+	}
+	if _, ok := shape["parent"][src.Name()]; ok {
+		t.Fatal("ShowStruct used source identity instead of mount alias")
+	}
+	if err := src.Set(NewDirective("/leaf", appendProc("-changed"))); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, dst, "/parent/alias/leaf/tip", "D-p-s-changed-t")
+	if err := dst.Set(NewDirective("/parent/alias/added", appendProc("-added"))); err != nil {
+		t.Fatal(err)
+	}
+	if !src.Has("/added") || !dst.Has("/parent/alias/added") {
+		t.Fatal("root Set did not change the attached source object")
+	}
+	graftTestGet(t, src, "/added", "D-p-s-added")
+	if err := dst.Del("/parent/alias/leaf/tip"); err != nil {
+		t.Fatal(err)
+	}
+	if src.Has("/leaf/tip") {
+		t.Fatal("root Del did not use the source's local path")
+	}
+	nested := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-nested")))
+	if err := src.Graft("/from-handle", nested); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, dst, "/parent/alias/from-handle", "D-p-s-nested")
+	if nested.Path() != "/parent/alias/from-handle" {
+		t.Fatalf("local-handle Graft lost outer mount position: %q", nested.Path())
 	}
 }
 
-func TestGraftAt_SourceReuseAndSnapshot(t *testing.T) {
-	proc := appendProc("-s")
-	src := graftTestTree(t, "standard", "SOURCE",
-		NewDirective("/", proc), NewDirective("/leaf", appendProc("-l")))
-	graftTestGet(t, src, "/leaf", "SOURCE-s-l")
-	a := graftTestTree(t, "standard", "A")
-	b := graftTestTree(t, "standard", "B")
-	if err := GraftAt(a, "/one", src); err != nil {
-		t.Fatal(err)
-	}
-	if err := GraftAt(b, "/two", src); err != nil {
-		t.Fatal(err)
-	}
-	ac := a.pickChild("one").(*tree)
-	bc := b.pickChild("two").(*tree)
-	if ac == src || bc == src || ac == bc || ac.pickChild("leaf") == src.pickChild("leaf") {
-		t.Fatal("source topology was attached by reference rather than copied")
-	}
-	if ac.procs[0] != proc || bc.procs[0] != proc {
-		t.Fatal("processor references were not preserved")
-	}
-	graftTestGet(t, a, "/one/leaf", "A-s-l")
-	graftTestGet(t, b, "/two/leaf", "B-s-l")
-	if err := src.Set(NewDirective("/", appendProc("-changed"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := src.Del("/leaf"); err != nil {
-		t.Fatal(err)
-	}
-	graftTestGet(t, a, "/one/leaf", "A-s-l")
-	graftTestGet(t, b, "/two/leaf", "B-s-l")
-	graftTestGet(t, src, "/", "SOURCE-changed")
-}
-
-func TestGraftAt_AllModePairs(t *testing.T) {
+func TestGraft_AllModePairs(t *testing.T) {
 	modes := []string{"standard", "lazy", "instant", "ttl"}
 	for _, parentMode := range modes {
 		for _, childMode := range modes {
@@ -166,26 +128,21 @@ func TestGraftAt_AllModePairs(t *testing.T) {
 				var parentRuns, childRuns atomic.Int32
 				dst := graftTestTree(t, parentMode, "D", NewDirective("/", graftTestCountProc(&parentRuns, "-p")))
 				src := graftTestTree(t, childMode, "SOURCE", NewDirective("/", graftTestCountProc(&childRuns, "-c")))
-				// A realized source must not transplant its cached SOURCE content.
 				graftTestGet(t, src, "/", "SOURCE-c")
 				childRuns.Store(0)
-				if err := GraftAt(dst, "/mount", src); err != nil {
+				parentBefore := parentRuns.Load()
+				if err := dst.Graft("/mount", src); err != nil {
 					t.Fatal(err)
 				}
-				mounted := dst.pickChild("mount").(*tree)
-				if mounted.lazyMode != src.lazyMode || mounted.instantMode != src.instantMode || mounted.cacheTTL != src.cacheTTL {
-					t.Fatal("mount changed source evaluation mode")
+				if dst.pickChild("mount") != src {
+					t.Fatal("mount did not retain source identity")
 				}
-				wantAtMount := int32(0)
-				if parentMode == "standard" && childMode == "standard" {
-					wantAtMount = 1
-				}
-				if got := childRuns.Load(); got != wantAtMount {
-					t.Fatalf("child executions at mount = %d; want %d", got, wantAtMount)
+				if childRuns.Load() != 0 || parentRuns.Load() != parentBefore {
+					t.Fatal("Graft executed a processor; even standard mounts must remain cold")
 				}
 				graftTestGet(t, dst, "/mount", "D-p-c")
 				if parentRuns.Load() != 1 || childRuns.Load() != 1 {
-					t.Fatalf("after first query parent/child runs = %d/%d; want 1/1", parentRuns.Load(), childRuns.Load())
+					t.Fatalf("after first query runs = %d/%d; want 1/1", parentRuns.Load(), childRuns.Load())
 				}
 				graftTestGet(t, dst, "/mount", "D-p-c")
 				wantParent, wantChild := int32(1), int32(1)
@@ -196,13 +153,13 @@ func TestGraftAt_AllModePairs(t *testing.T) {
 					wantChild = 2
 				}
 				if parentRuns.Load() != wantParent || childRuns.Load() != wantChild {
-					t.Fatalf("after repeated query runs = %d/%d; want %d/%d", parentRuns.Load(), childRuns.Load(), wantParent, wantChild)
+					t.Fatalf("after second query runs = %d/%d; want %d/%d", parentRuns.Load(), childRuns.Load(), wantParent, wantChild)
 				}
 				if parentMode == "ttl" {
 					graftTestExpire(dst)
 				}
 				if childMode == "ttl" {
-					graftTestExpire(mounted)
+					graftTestExpire(src)
 				}
 				graftTestGet(t, dst, "/mount", "D-p-c")
 				if parentMode == "instant" || parentMode == "ttl" {
@@ -212,15 +169,15 @@ func TestGraftAt_AllModePairs(t *testing.T) {
 					wantChild++
 				}
 				if parentRuns.Load() != wantParent || childRuns.Load() != wantChild {
-					t.Fatalf("after forced TTL expiry runs = %d/%d; want %d/%d", parentRuns.Load(), childRuns.Load(), wantParent, wantChild)
+					t.Fatalf("after expiry runs = %d/%d; want %d/%d", parentRuns.Load(), childRuns.Load(), wantParent, wantChild)
 				}
 			})
 		}
 	}
 }
 
-func TestGraftAt_DeferredParentRefreshesStandardDescendants(t *testing.T) {
-	for _, mode := range []string{"lazy", "ttl"} {
+func TestGraft_DeferredParentRefreshesStandardDescendants(t *testing.T) {
+	for _, mode := range []string{"lazy", "instant", "ttl"} {
 		t.Run(mode, func(t *testing.T) {
 			var parentRuns, childRuns, leafRuns atomic.Int32
 			parentProc := &driver.RawProcessor{Proc: func(_ *driver.RealizeContext, _ []byte) ([]byte, error) {
@@ -232,28 +189,30 @@ func TestGraftAt_DeferredParentRefreshesStandardDescendants(t *testing.T) {
 				NewDirective("/leaf", graftTestCountProc(&leafRuns, "-l")))
 			childRuns.Store(0)
 			leafRuns.Store(0)
-			if err := GraftAt(dst, "/mount", src); err != nil {
+			if err := dst.Graft("/mount", src); err != nil {
 				t.Fatal(err)
 			}
 			if parentRuns.Load() != 0 || childRuns.Load() != 0 || leafRuns.Load() != 0 {
-				t.Fatal("standard descendants were eagerly evaluated below a deferred ancestor")
+				t.Fatal("Graft evaluated a deferred ancestry")
 			}
 			graftTestGet(t, dst, "/mount/leaf", "P1-s-l")
-			graftTestGet(t, dst, "/mount/leaf", "P1-s-l")
-			if mode == "ttl" {
+			switch mode {
+			case "ttl":
 				graftTestExpire(dst)
-			} else if err := dst.Set(NewDirective("/", parentProc)); err != nil {
-				t.Fatal(err)
+			case "lazy":
+				if err := dst.Set(NewDirective("/", parentProc)); err != nil {
+					t.Fatal(err)
+				}
 			}
 			graftTestGet(t, dst, "/mount/leaf", "P2-s-l")
 			if childRuns.Load() != 2 || leafRuns.Load() != 2 {
-				t.Fatalf("standard subtree did not recompose exactly once: child/leaf = %d/%d", childRuns.Load(), leafRuns.Load())
+				t.Fatalf("standard descendants did not recompose: %d/%d", childRuns.Load(), leafRuns.Load())
 			}
 		})
 	}
 }
 
-func TestGraftAt_NilParentContentIsInherited(t *testing.T) {
+func TestGraft_NilParentContentIsInherited(t *testing.T) {
 	var returnNil atomic.Bool
 	dst := graftTestTree(t, "instant", "D", NewDirective("/", &driver.RawProcessor{
 		Proc: func(_ *driver.RealizeContext, _ []byte) ([]byte, error) {
@@ -264,93 +223,250 @@ func TestGraftAt_NilParentContentIsInherited(t *testing.T) {
 		},
 	}))
 	var nilInputs atomic.Int32
-	src := graftTestTree(t, "standard", "SOURCE",
-		NewDirective("/", &driver.RawProcessor{Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
+	src := graftTestTree(t, "standard", "SOURCE", NewDirective("/", &driver.RawProcessor{
+		Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
 			if before == nil {
 				nilInputs.Add(1)
 			}
 			return appendProc("-s").Process(rc, before)
-		}}),
-		NewDirective("/leaf", appendProc("-l")))
-	if err := GraftAt(dst, "/mount", src); err != nil {
+		},
+	}), NewDirective("/leaf", appendProc("-l")))
+	if err := dst.Graft("/mount", src); err != nil {
 		t.Fatal(err)
 	}
 	graftTestGet(t, dst, "/mount/leaf", "BEFORE-s-l")
 	returnNil.Store(true)
 	graftTestGet(t, dst, "/mount/leaf", "-s-l")
 	if nilInputs.Load() != 1 {
-		t.Fatalf("mounted node saw nil input %d times; want once", nilInputs.Load())
+		t.Fatalf("nil parent was not inherited: %d nil inputs", nilInputs.Load())
 	}
 }
 
-func TestGraftAt_DynamicParamsRemainIsolated(t *testing.T) {
+func TestGraft_StandardSetBeforeFirstQueryIsDeferred(t *testing.T) {
+	var parentRuns, updatedRuns, addedRuns atomic.Int32
+	dst := graftTestTree(t, "lazy", "D", NewDirective("/", graftTestCountProc(&parentRuns, "-p")))
+	src := graftTestTree(t, "standard", "SOURCE", NewDirective("/", appendProc("-s")), NewDirective("/leaf", appendProc("-l")))
+	if err := dst.Graft("/mount", src); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Set(NewDirective("/mount", graftTestCountProc(&updatedRuns, "-updated"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Set(NewDirective("/mount/added", graftTestCountProc(&addedRuns, "-added"))); err != nil {
+		t.Fatal(err)
+	}
+	if parentRuns.Load() != 0 || updatedRuns.Load() != 0 || addedRuns.Load() != 0 {
+		t.Fatal("Set evaluated a standard node whose mounted base is not ready")
+	}
+	graftTestGet(t, dst, "/mount/added", "D-p-updated-added")
+	graftTestGet(t, dst, "/mount/leaf", "D-p-updated-l")
+	if updatedRuns.Load() != 1 || addedRuns.Load() != 1 {
+		t.Fatalf("deferred Set ran %d/%d times", updatedRuns.Load(), addedRuns.Load())
+	}
+}
+
+func TestGraft_ProcessorFailureIsDeferredToQuery(t *testing.T) {
+	wantErr := errors.New("mounted runtime failure")
+	var active atomic.Bool
+	var runs atomic.Int32
+	src := graftTestTree(t, "standard", "SOURCE", NewDirective("/", &driver.RawProcessor{
+		Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
+			runs.Add(1)
+			if active.Load() {
+				return nil, wantErr
+			}
+			return before, nil
+		},
+	}))
+	active.Store(true)
+	runs.Store(0)
+	dst := graftTestTree(t, "standard", "D", NewDirective("/mount/old"))
+	if err := dst.Graft("/mount", src); err != nil {
+		t.Fatalf("Graft must not execute the failing processor: %v", err)
+	}
+	if runs.Load() != 0 || dst.pickChild("mount") != src || dst.Has("/mount/old") {
+		t.Fatal("Graft did not directly publish the cold replacement")
+	}
+	if _, err := dst.Get("/mount"); !errors.Is(err, wantErr) {
+		t.Fatalf("Get error = %v; want %v", err, wantErr)
+	}
+}
+
+func TestGraft_DynamicParamsAndMountedPaths(t *testing.T) {
 	var staticRuns atomic.Int32
-	dst := graftTestTree(t, "standard", "hello ${user}")
-	src := graftTestTree(t, "lazy", "SOURCE",
-		NewDirective("/", graftTestCountProc(&staticRuns, "!"), &driver.TemplateProcessor{}))
-	if err := GraftAt(dst, "/mount", src); err != nil {
+	var gotPaths []string
+	capture := &driver.RawProcessor{Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
+		gotPaths = append(gotPaths, rc.TreePath)
+		return before, nil
+	}}
+	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/leaf",
+		graftTestCountProc(&staticRuns, "!"), &driver.TemplateProcessor{}, capture))
+	dst := graftTestTree(t, "standard", "hello ${user}", NewDirective("/parent"))
+	if err := dst.Graft("/parent/alias", src); err != nil {
 		t.Fatal(err)
 	}
 	for _, user := range []string{"alice", "bob", "alice"} {
-		got, err := dst.GetWithContext(paramRC(map[string]string{"user": user}), "/mount")
+		got, err := dst.GetWithContext(paramRC(map[string]string{"user": user}), "/parent/alias/leaf")
 		if err != nil || string(got) != "hello "+user+"!" {
 			t.Fatalf("query %s = %q, %v", user, got, err)
 		}
 	}
-	graftTestGet(t, dst, "/mount", "hello ${user}!")
-	if staticRuns.Load() != 1 {
-		t.Fatalf("static prefix ran %d times; want once", staticRuns.Load())
+	got, err := src.GetWithContext(paramRC(map[string]string{"user": "local"}), "/leaf")
+	if err != nil || string(got) != "hello local!" {
+		t.Fatalf("local mounted-handle context query = %q, %v", got, err)
 	}
-	mounted := dst.pickChild("mount").(*tree)
-	if string(mounted.get()) != "hello ${user}!" {
-		t.Fatalf("dynamic query polluted mounted cache: %q", mounted.get())
+	graftTestGet(t, dst, "/parent/alias/leaf", "hello ${user}!")
+	if staticRuns.Load() != 1 || len(gotPaths) != 4 {
+		t.Fatalf("static/dynamic runs = %d/%d; want 1/4", staticRuns.Load(), len(gotPaths))
 	}
-	graftTestGet(t, src, "/", "SOURCE!")
+	for _, path := range gotPaths {
+		if path != "/parent/alias/leaf" {
+			t.Fatalf("dynamic TreePath = %q", path)
+		}
+	}
 }
 
-type graftTestParamProcessor struct{ *driver.RawProcessor }
+func TestGraft_PreservesDefaultContextFallbackAndLimiter(t *testing.T) {
+	type contextKey struct{}
+	defaultRC := &driver.RealizeContext{
+		Context:  context.WithValue(context.Background(), contextKey{}, "source-context"),
+		TreePath: "source-sentinel", ParentContent: []byte("source-parent"),
+	}
+	var paths []string
+	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", &driver.RawProcessor{
+		Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
+			paths = append(paths, rc.TreePath)
+			value, _ := rc.Value(contextKey{}).(string)
+			return appendProc("-"+value).Process(rc, before)
+		},
+	}))
+	src.SetDefaultContext(defaultRC)
+	src.SetFallback(appendProc("-fallback"))
+	src.SetRateLimit(rate.Limit(0), 1)
+	originalDriver, originalLimiter := src.driver, src.rateLimiter
+	dst := graftTestTree(t, "standard", "D")
+	if err := dst.Graft("/alias", src); err != nil {
+		t.Fatal(err)
+	}
+	if src.driver != originalDriver || src.rateLimiter != originalLimiter {
+		t.Fatal("direct mount replaced the source driver or rate limiter")
+	}
+	graftTestGet(t, dst, "/alias", "D-source-context")
+	graftTestGet(t, dst, "/alias/missing", "D-source-context-fallback")
+	if len(paths) != 1 || paths[0] != "/alias" {
+		t.Fatalf("default-context TreePath = %v", paths)
+	}
+	if defaultRC.TreePath != "source-sentinel" || string(defaultRC.ParentContent) != "source-parent" {
+		t.Fatal("mounted query mutated source default context")
+	}
+	src.realizeMu.Lock()
+	src.realizedAt = time.Time{}
+	src.realizeMu.Unlock()
+	if _, err := dst.Get("/alias"); !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("mounted source lost limiter token state: %v", err)
+	}
+}
 
-func (*graftTestParamProcessor) ParamKeys() []string { return []string{"user"} }
+func TestGraft_DefaultContextTracksRemountWithoutMutation(t *testing.T) {
+	defaultRC := &driver.RealizeContext{
+		Context: context.Background(), TreePath: "source-sentinel", ParentContent: []byte("source-parent"),
+	}
+	var paths, parents []string
+	source := graftTestTree(t, "instant", "SOURCE", NewDirective("/", &driver.RawProcessor{
+		Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
+			paths = append(paths, rc.TreePath)
+			parents = append(parents, string(rc.ParentContent))
+			return before, nil
+		},
+	}))
+	source.SetDefaultContext(defaultRC)
+	a := graftTestTree(t, "standard", "A")
+	if err := a.Graft("/alias", source); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, a, "/alias", "A")
+	if err := a.Del("/alias"); err != nil {
+		t.Fatal(err)
+	}
+	b := graftTestTree(t, "standard", "B", NewDirective("/parent"))
+	if err := b.Graft("/parent/renamed", source); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, b, "/parent/renamed", "B")
+	if len(paths) != 2 || paths[0] != "/alias" || paths[1] != "/parent/renamed" {
+		t.Fatalf("default-context mounted paths = %v", paths)
+	}
+	if len(parents) != 2 || parents[0] != "A" || parents[1] != "B" {
+		t.Fatalf("default-context inherited parents = %v", parents)
+	}
+	if defaultRC.TreePath != "source-sentinel" || string(defaultRC.ParentContent) != "source-parent" {
+		t.Fatal("query or remount mutated the retained source default context")
+	}
+}
 
-func TestGraftAt_DynamicAndFallbackMutationCannotCorruptCaches(t *testing.T) {
-	for _, kind := range []string{"dynamic", "fallback"} {
+func TestGraft_RejectsInvalidPathsAndSources(t *testing.T) {
+	for _, kind := range []string{"root", "empty", "empty_segment", "missing_parent", "nil", "typed_nil", "self"} {
 		t.Run(kind, func(t *testing.T) {
-			mutate := &driver.RawProcessor{Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
-				if len(before) != 0 {
-					before[0] = 'X'
-				}
-				if rc != nil && len(rc.ParentContent) != 0 {
-					rc.ParentContent[0] = 'Y'
-				}
-				return before, nil
-			}}
-			procs := []driver.Processor{appendProc("-static")}
-			if kind == "dynamic" {
-				procs = append(procs, &graftTestParamProcessor{mutate})
+			dst := graftTestTree(t, "standard", "D", NewDirective("/keep", appendProc("-old")))
+			var source Tree = graftTestTree(t, "lazy", "SOURCE")
+			path := "/keep"
+			switch kind {
+			case "root":
+				path = "/"
+			case "empty":
+				path = ""
+			case "empty_segment":
+				path = "/a//b"
+			case "missing_parent":
+				path = "/missing/child"
+			case "nil":
+				source = nil
+			case "typed_nil":
+				var native *tree
+				source = native
+			case "self":
+				source = dst
 			}
-			src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", procs...))
-			if kind == "fallback" {
-				src.SetFallback(mutate)
+			old := dst.pickChild("keep")
+			if err := dst.Graft(path, source); err == nil {
+				t.Fatal("expected invalid graft error")
 			}
-			graftTestGet(t, src, "/", "SOURCE-static")
-			dst := graftTestTree(t, "standard", "DEST")
-			if err := GraftAt(dst, "/mount", src); err != nil {
-				t.Fatal(err)
+			if dst.pickChild("keep") != old {
+				t.Fatal("invalid graft replaced an existing node")
 			}
-			path := "/mount"
-			if kind == "fallback" {
-				path += "/missing"
-			}
-			for i := 0; i < 2; i++ {
-				out, err := dst.GetWithContext(paramRC(map[string]string{"user": "alice"}), path)
-				if err != nil || string(out) != "XEST-static" {
-					t.Fatalf("mutating %s result = %q, %v", kind, out, err)
-				}
-				graftTestGet(t, dst, "/", "DEST")
-				graftTestGet(t, dst, "/mount", "DEST-static")
-				graftTestGet(t, src, "/", "SOURCE-static")
+			graftTestGet(t, dst, "/keep", "D-old")
+		})
+	}
+}
+
+func TestGraft_SingleParentOwnershipAndCycles(t *testing.T) {
+	a := graftTestTree(t, "standard", "A")
+	b := graftTestTree(t, "standard", "B")
+	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/leaf"))
+	if err := a.Graft("/mount", src); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		dst    Tree
+		path   string
+		source Tree
+	}{
+		{"second_parent", b, "/other", src},
+		{"same_position", a, "/mount", src},
+		{"second_alias", a, "/other", src},
+		{"descendant_source", b, "/other", src.pickChild("leaf")},
+		{"ancestor_cycle", a, "/mount/leaf/cycle", a},
+		{"self_cycle", src, "/self", src},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.dst.Graft(tc.path, tc.source); err == nil {
+				t.Fatal("accepted multiple ownership or a cycle")
 			}
 		})
+	}
+	if a.pickChild("mount") != src || b.Has("/other") || a.Has("/other") {
+		t.Fatal("failed ownership check changed topology")
 	}
 }
 
@@ -365,270 +481,155 @@ func (d *graftTestSourceDriver) Realize(rc *driver.RealizeContext, before []byte
 	return d.StdRealizer.Realize(rc, before, procs...)
 }
 
-func TestGraftAt_RetainsSourceRealizerButUsesDestinationPaths(t *testing.T) {
+func TestGraft_NativeSourceKeepsDriverWithRootPathSyntax(t *testing.T) {
 	var calls atomic.Int32
 	sourceDriver := &graftTestSourceDriver{
 		testPathDriver: &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")},
 		calls:          &calls,
 	}
-	src, err := NewLazyTree(sourceDriver, "source", "SOURCE",
-		NewDirective(".", appendProc("-s")), NewDirective(".leaf", appendProc("-l")))
+	src, err := NewLazyTree(sourceDriver, "source", "SOURCE", NewDirective(".", appendProc("-s")), NewDirective(".leaf", appendProc("-l")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	dst := graftTestTree(t, "standard", "D", NewDirective("/parent", appendProc("-p")))
-	if err := GraftAt(dst, "/parent/mount", src); err != nil {
+	if err := dst.Graft("/parent/alias", src); err != nil {
 		t.Fatal(err)
 	}
-	graftTestGet(t, dst, "/parent/mount/leaf", "D-p-s-l")
+	if src.(*tree).driver != sourceDriver {
+		t.Fatal("Graft replaced source driver instead of retaining format execution")
+	}
+	graftTestGet(t, dst, "/parent/alias/leaf", "D-p-s-l")
 	if calls.Load() != 2 {
 		t.Fatalf("source realizer calls = %d; want 2", calls.Load())
 	}
-	if err := dst.Set(NewDirective("/parent/mount/added", appendProc("-a"))); err != nil {
+	if err := dst.Set(NewDirective("/parent/alias/added", appendProc("-a"))); err != nil {
 		t.Fatal(err)
 	}
-	graftTestGet(t, dst, "/parent/mount/added", "D-p-s-a")
-	if !dst.Has("/parent/mount/added") {
-		t.Fatal("mounted source driver still parses destination paths with its original delimiter")
+	graftTestGet(t, dst, "/parent/alias/added", "D-p-s-a")
+	if !dst.Has("/parent/alias/added") {
+		t.Fatal("Has switched from root parser to source parser")
 	}
-	graftTestGet(t, src, ".leaf", "SOURCE-s-l")
+	if err := dst.Del("/parent/alias/added"); err != nil {
+		t.Fatal(err)
+	}
+	if dst.Has("/parent/alias/added") {
+		t.Fatal("Del switched from root parser to source parser")
+	}
+	other := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-other")))
+	if err := dst.Graft("/parent/alias/leaf/other", other); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, dst, "/parent/alias/leaf/other", "D-p-s-l-other")
+	if other.Path() != "/parent/alias/leaf/other" {
+		t.Fatalf("Path did not use root syntax: %q", other.Path())
+	}
 }
 
-func TestGraftAt_PreservesFallbackContextAndIndependentLimiter(t *testing.T) {
-	type contextKey struct{}
-	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", &driver.RawProcessor{
-		Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
-			value, _ := rc.Value(contextKey{}).(string)
-			return appendProc("-"+value).Process(rc, before)
-		},
-	}))
-	src.SetDefaultContext(&driver.RealizeContext{Context: context.WithValue(context.Background(), contextKey{}, "source-context")})
-	src.SetFallback(appendProc("-fallback"))
-	src.SetRateLimit(rate.Limit(0), 1)
-	dst := graftTestTree(t, "standard", "D")
-	for _, name := range []string{"one", "two"} {
-		if err := GraftAt(dst, "/"+name, src); err != nil {
-			t.Fatal(err)
+func TestGraft_CustomRootParserControlsNativeTraversal(t *testing.T) {
+	rootDriver := &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")}
+	root, err := NewLazyTree(rootDriver, "root", "R", NewDirective(".parent", appendProc("-p")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-s")), NewDirective("/leaf", appendProc("-l")))
+	if err := root.Graft(".parent.alias", source); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, root, ".parent.alias.leaf", "R-p-s-l")
+	if source.Path() != ".parent.alias" || source.pickChild("leaf").Path() != ".parent.alias.leaf" {
+		t.Fatalf("mounted paths ignored root parser: %q/%q", source.Path(), source.pickChild("leaf").Path())
+	}
+	if err := root.Set(NewDirective(".parent.alias.added", appendProc("-a"))); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, root, ".parent.alias.added", "R-p-s-a")
+	if !root.Has(".parent.alias.added") {
+		t.Fatal("custom root Has did not consume local segments")
+	}
+	if err := root.Del(".parent.alias.added"); err != nil {
+		t.Fatal(err)
+	}
+	if root.Has(".parent.alias.added") {
+		t.Fatal("custom root Del did not consume local segments")
+	}
+}
+
+// This intentionally does not embed a native tree: every public operation is
+// overridden so a promoted Get/Set cannot conceal an incorrect full-path call.
+type graftTestForeignTree struct {
+	calls       map[string]string
+	setProcs    []driver.Processor
+	graftSource Tree
+	params      map[string]string
+}
+
+func newGraftTestForeignTree() *graftTestForeignTree {
+	return &graftTestForeignTree{calls: make(map[string]string)}
+}
+func (*graftTestForeignTree) Name() string { return "foreign-identity" }
+func (*graftTestForeignTree) Path() string { return "" }
+func (f *graftTestForeignTree) Get(path string) ([]byte, error) {
+	f.calls["Get"] = path
+	return []byte("foreign:" + path), nil
+}
+func (f *graftTestForeignTree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, error) {
+	f.calls["GetWithContext"] = path
+	if rc != nil {
+		f.params = rc.Params
+	}
+	return []byte("foreign-context:" + path), nil
+}
+func (f *graftTestForeignTree) Set(d Directive) error {
+	f.calls["Set"] = d.Path()
+	f.setProcs = d.Processors()
+	return nil
+}
+func (f *graftTestForeignTree) Has(path string) bool  { f.calls["Has"] = path; return true }
+func (f *graftTestForeignTree) Del(path string) error { f.calls["Del"] = path; return nil }
+func (f *graftTestForeignTree) Graft(path string, source Tree) error {
+	f.calls["Graft"] = path
+	f.graftSource = source
+	return nil
+}
+func (*graftTestForeignTree) ShowStruct() []byte                       { return []byte(`{}`) }
+func (*graftTestForeignTree) SetRateLimit(rate.Limit, int)             {}
+func (*graftTestForeignTree) SetFallback(driver.Processor)             {}
+func (*graftTestForeignTree) SetDefaultContext(*driver.RealizeContext) {}
+
+func TestGraft_ForeignTreeReceivesOnlyRemainingLocalPaths(t *testing.T) {
+	dst := graftTestTree(t, "standard", "D", NewDirective("/parent"))
+	foreign := newGraftTestForeignTree()
+	if err := dst.Graft("/parent/alias", foreign); err != nil {
+		t.Fatal(err)
+	}
+	graftTestGet(t, dst, "/parent/alias/leaf/child", "foreign:/leaf/child")
+	got, err := dst.GetWithContext(paramRC(map[string]string{"user": "alice"}), "/parent/alias/leaf/child")
+	if err != nil || string(got) != "foreign-context:/leaf/child" || foreign.params["user"] != "alice" {
+		t.Fatalf("foreign context query = %q, %v, params=%v", got, err, foreign.params)
+	}
+	proc := appendProc("-set")
+	if err := dst.Set(NewDirective("/parent/alias/leaf/child", proc)); err != nil {
+		t.Fatal(err)
+	}
+	if len(foreign.setProcs) != 1 || foreign.setProcs[0] != proc {
+		t.Fatal("local directive lost processors")
+	}
+	if !dst.Has("/parent/alias/leaf/child") {
+		t.Fatal("foreign Has result was lost")
+	}
+	if err := dst.Del("/parent/alias/leaf/child"); err != nil {
+		t.Fatal(err)
+	}
+	other := graftTestTree(t, "lazy", "OTHER")
+	if err := dst.Graft("/parent/alias/leaf/child", other); err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{"Get", "GetWithContext", "Set", "Has", "Del", "Graft"} {
+		if got := foreign.calls[method]; got != "/leaf/child" {
+			t.Errorf("foreign %s received %q; want local /leaf/child", method, got)
 		}
-		graftTestGet(t, dst, "/"+name, "D-source-context")
-		graftTestGet(t, dst, "/"+name+"/missing", "D-source-context-fallback")
 	}
-	one := dst.pickChild("one").(*tree)
-	two := dst.pickChild("two").(*tree)
-	if one.rateLimiter == nil || one.rateLimiter == two.rateLimiter || one.rateLimiter == src.rateLimiter {
-		t.Fatal("rate limiters must preserve settings without sharing token state")
+	if foreign.graftSource != other {
+		t.Fatal("foreign Graft did not receive original source object")
 	}
-	graftTestGet(t, src, "/", "SOURCE-source-context")
-	// Lazy mode has no TTL; explicit invalidation requires another realization.
-	one.realizeMu.Lock()
-	one.realizedAt = time.Time{}
-	one.realizeMu.Unlock()
-	if _, err := dst.Get("/one"); !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("clone lost rate limit settings: got %v", err)
-	}
-	graftTestGet(t, dst, "/two", "D-source-context")
-}
-
-type graftTestCustomTree struct{ Tree }
-
-func TestGraftAt_RejectsInvalidInputsWithoutChangingDestination(t *testing.T) {
-	dst := graftTestTree(t, "standard", "D", NewDirective("/keep", appendProc("-keep")))
-	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", appendProc("-s")))
-	var nilNative *tree
-	for _, tc := range []struct {
-		name string
-		dst  Tree
-		path string
-		src  Tree
-	}{
-		{"nil_destination", nil, "/mount", src},
-		{"typed_nil_destination", nilNative, "/mount", src},
-		{"nil_source", dst, "/mount", nil},
-		{"typed_nil_source", dst, "/mount", nilNative},
-		{"custom_destination", &graftTestCustomTree{dst}, "/mount", src},
-		{"custom_source", dst, "/mount", &graftTestCustomTree{src}},
-		{"subtree_destination", dst.pickChild("keep"), "/keep/mount", src},
-		{"root", dst, "/", src},
-		{"empty_root", dst, "", src},
-		{"missing_parent", dst, "/missing/mount", src},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := GraftAt(tc.dst, tc.path, tc.src); err == nil {
-				t.Fatal("expected error")
-			}
-			graftTestGet(t, dst, "/keep", "D-keep")
-			if dst.Has("/mount") || dst.Has("/missing") || dst.Has("/keep/mount") {
-				t.Fatal("invalid mount modified the destination topology")
-			}
-		})
-	}
-}
-
-func TestGraftAt_SetStandardNodesBeforeDeferredParentIsRealized(t *testing.T) {
-	var parentRuns, updatedRuns, addedRuns atomic.Int32
-	dst := graftTestTree(t, "lazy", "D", NewDirective("/", graftTestCountProc(&parentRuns, "-p")))
-	src := graftTestTree(t, "standard", "SOURCE",
-		NewDirective("/", appendProc("-s")), NewDirective("/leaf", appendProc("-l")))
-	if err := GraftAt(dst, "/mount", src); err != nil {
-		t.Fatal(err)
-	}
-	if err := dst.Set(NewDirective("/mount", graftTestCountProc(&updatedRuns, "-updated"))); err != nil {
-		t.Fatal(err)
-	}
-	if err := dst.Set(NewDirective("/mount/added", graftTestCountProc(&addedRuns, "-added"))); err != nil {
-		t.Fatal(err)
-	}
-	if parentRuns.Load() != 0 || updatedRuns.Load() != 0 || addedRuns.Load() != 0 {
-		t.Fatal("Set eagerly evaluated a standard node before its deferred parent was known")
-	}
-	graftTestGet(t, dst, "/mount/added", "D-p-updated-added")
-	graftTestGet(t, dst, "/mount/leaf", "D-p-updated-l")
-	if updatedRuns.Load() != 1 || addedRuns.Load() != 1 {
-		t.Fatalf("deferred Set executions = %d/%d; want 1/1", updatedRuns.Load(), addedRuns.Load())
-	}
-	graftTestGet(t, src, "/leaf", "SOURCE-s-l")
-}
-
-func TestGraftAt_EagerFailureDoesNotPublishOrMutateParent(t *testing.T) {
-	wantErr := errors.New("failed eager processor")
-	src := graftTestTree(t, "standard", "SOURCE", NewDirective("/", &driver.RawProcessor{
-		Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
-			if string(before) == "DEST" {
-				// A failed processor must not corrupt the destination's slice.
-				before[0] = 'X'
-				return nil, wantErr
-			}
-			return before, nil
-		},
-	}))
-	dst := graftTestTree(t, "standard", "DEST",
-		NewDirective("/mount", appendProc("-old")),
-		NewDirective("/mount/leaf", appendProc("-leaf")))
-	old := dst.pickChild("mount")
-	if err := GraftAt(dst, "/mount", src); !errors.Is(err, wantErr) {
-		t.Fatalf("mount error = %v; want %v", err, wantErr)
-	}
-	if dst.pickChild("mount") != old {
-		t.Fatal("failed eager preparation published its replacement")
-	}
-	graftTestGet(t, dst, "/", "DEST")
-	graftTestGet(t, dst, "/mount/leaf", "DEST-old-leaf")
-	graftTestGet(t, src, "/", "SOURCE")
-}
-
-func TestGraftAt_InPlaceProcessorCannotMutateParentOrSourceCache(t *testing.T) {
-	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", &driver.RawProcessor{
-		Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
-			if len(before) != 0 {
-				before[0] = 'X'
-			}
-			return before, nil
-		},
-	}))
-	graftTestGet(t, src, "/", "XOURCE")
-	dst := graftTestTree(t, "standard", "DEST")
-	for _, name := range []string{"one", "two"} {
-		if err := GraftAt(dst, "/"+name, src); err != nil {
-			t.Fatal(err)
-		}
-		graftTestGet(t, dst, "/"+name, "XEST")
-		graftTestGet(t, dst, "/", "DEST")
-		graftTestGet(t, src, "/", "XOURCE")
-	}
-}
-
-func TestGraftAt_RejectsMalformedSourceTopology(t *testing.T) {
-	for _, kind := range []string{"cycle", "typed_nil_child", "custom_child"} {
-		t.Run(kind, func(t *testing.T) {
-			dst := graftTestTree(t, "standard", "D", NewDirective("/mount", appendProc("-old")))
-			src := graftTestTree(t, "lazy", "SOURCE")
-			switch kind {
-			case "cycle":
-				src.Graft(src)
-			case "typed_nil_child":
-				var nilChild *tree
-				src.children["bad"] = nilChild
-			case "custom_child":
-				src.Graft(&graftTestCustomTree{graftTestTree(t, "lazy", "CUSTOM")})
-			}
-			old := dst.pickChild("mount")
-			if err := GraftAt(dst, "/mount", src); err == nil {
-				t.Fatal("expected malformed-source error")
-			}
-			if dst.pickChild("mount") != old {
-				t.Fatal("invalid source replaced the destination")
-			}
-			graftTestGet(t, dst, "/mount", "D-old")
-		})
-	}
-}
-
-func TestGraftAt_DoesNotChangeLegacyGraft(t *testing.T) {
-	dst := graftTestTree(t, "standard", "D")
-	src := graftTestTree(t, "lazy", "SOURCE")
-	dst.Graft(src)
-	if dst.pickChild(src.Name()) != src || src.Path() != "" || src.level != 0 {
-		t.Fatal("legacy Graft must remain a raw attachment without copying or rebasing")
-	}
-}
-
-func TestGraftAt_ConcurrentReplacementAndReads(t *testing.T) {
-	dst := graftTestTree(t, "standard", "D")
-	a := graftTestTree(t, "lazy", "SOURCE-A", NewDirective("/", appendProc("-A")), NewDirective("/leaf", appendProc("-a")))
-	b := graftTestTree(t, "lazy", "SOURCE-B", NewDirective("/", appendProc("-B")), NewDirective("/leaf", appendProc("-b")))
-	if err := GraftAt(dst, "/mount", a); err != nil {
-		t.Fatal(err)
-	}
-	const readers, writers = 4, 2
-	// Structural writers are caller-serialized; readers intentionally are not.
-	var structuralMu sync.Mutex
-	start := make(chan struct{})
-	errs := make(chan error, readers+writers)
-	var wg sync.WaitGroup
-	for worker := 0; worker < readers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 300; i++ {
-				got, err := dst.Get("/mount/leaf")
-				if err != nil {
-					errs <- fmt.Errorf("replacement read failed: %w", err)
-					return
-				}
-				if string(got) != "D-A-a" && string(got) != "D-B-b" {
-					errs <- fmt.Errorf("torn replacement read = %q", got)
-					return
-				}
-			}
-		}()
-	}
-	for worker := 0; worker < writers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 100; i++ {
-				source := a
-				if i%2 == 1 {
-					source = b
-				}
-				structuralMu.Lock()
-				err := GraftAt(dst, "/mount", source)
-				structuralMu.Unlock()
-				if err != nil {
-					errs <- fmt.Errorf("concurrent mount: %w", err)
-					return
-				}
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Error(err)
-	}
-	graftTestGet(t, a, "/leaf", "SOURCE-A-A-a")
-	graftTestGet(t, b, "/leaf", "SOURCE-B-B-b")
 }
