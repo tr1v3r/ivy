@@ -57,6 +57,7 @@ type Forest interface {
 type Tree interface {
 	// Name returns the tree name.
 	Name() string
+
 	// Path returns the effective mount location in the enclosing tree.
 	// Returns "" for an unattached root. Operation paths are local to the
 	// receiver root, even when Path reports a nonempty mount location.
@@ -64,13 +65,16 @@ type Tree interface {
 
 	// Set adds or updates a directive on the tree.
 	Set(Directive) error
+
 	// Get retrieves the value at the given path.
 	Get(path string) (val []byte, err error)
+
 	// GetWithContext retrieves a value with runtime context for dynamic construction.
 	GetWithContext(rc *driver.RealizeContext, path string) (val []byte, err error)
 
 	// Has checks if a node exists at the given path.
 	Has(path string) bool
+
 	// Del deletes a node at the given path.
 	Del(path string) error
 
@@ -80,6 +84,7 @@ type Tree interface {
 	// Implementations own positioning, inheritance, cache and concurrency
 	// behavior. For native sources, the native implementation requires
 	// detached ownership and invalidates caches without running processors.
+	// A nil source or missing parent wraps ErrNotExistsTree in that implementation.
 	Graft(path string, source Tree) error
 
 	// ShowStruct returns the tree structure as JSON.

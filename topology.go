@@ -12,6 +12,7 @@ func (t *tree) topologyRoot() *tree {
 		if link == nil {
 			return t
 		}
+
 		t = link.parent
 	}
 }
@@ -36,12 +37,15 @@ func lockTopologyRoots(nodes ...*tree) func() {
 				}
 			}
 		}
+
 		slices.SortFunc(roots, func(a, b *tree) int {
 			return cmp.Compare(reflect.ValueOf(a).Pointer(), reflect.ValueOf(b).Pointer())
 		})
+
 		for _, root := range roots {
 			root.topologyMu.Lock()
 		}
+
 		valid := true
 		for _, node := range nodes {
 			if node != nil && !slices.Contains(roots, node.topologyRoot()) {
@@ -49,9 +53,11 @@ func lockTopologyRoots(nodes ...*tree) func() {
 				break
 			}
 		}
+
 		if valid {
 			return func() { unlockTopologyRoots(roots) }
 		}
+
 		unlockTopologyRoots(roots)
 	}
 }

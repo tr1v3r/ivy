@@ -19,9 +19,11 @@ var _ Tree = (*tree)(nil)
 // tree is a rule tree structure.
 type tree struct {
 	name string // immutable source identity; mount aliases live on edges
+
 	// A single parent link determines the effective path. Moving a subtree
 	// updates only its root link, never every descendant's path or level.
 	mount atomic.Pointer[treeMount]
+
 	// Structural edits use the current enclosing root's mutex. Every node
 	// has its own dormant mutex ready if it later becomes a detached root.
 	topologyMu sync.Mutex
@@ -87,6 +89,7 @@ type tree struct {
 	// OLDER version leaves it alone (older = stale carry, the cache is
 	// already based on newer parent content than the caller saw).
 	realizedFrom uint64
+
 	// basePending defers eager Set on a mounted standard node until its
 	// deferred ancestry first supplies a valid base. Atomic so creating a
 	// child never needs to acquire its parent's realization lock.
@@ -122,6 +125,7 @@ func (t *tree) build(rules ...Directive) error {
 			return fmt.Errorf("apply rule fail: %w", err)
 		}
 	}
+
 	return nil
 }
 
@@ -136,10 +140,12 @@ func (t *tree) Path() string {
 		names = append(names, link.name)
 		root = link.parent
 	}
+
 	path := ""
 	for i := len(names) - 1; i >= 0; i-- {
 		path = root.driver.AppendPath(path, names[i])
 	}
+
 	return path
 }
 
@@ -166,14 +172,17 @@ func (t *tree) setQuery(q pathQuery, procs []driver.Processor) error {
 	if q.done() {
 		return t.apply(procs...)
 	}
+
 	child, err := t.getChild(q.head())
 	if err != nil {
 		return err
 	}
+
 	rest := q.next()
-	if ct, ok := child.(*tree); ok {
-		return ct.setQuery(rest, procs)
+	if nativeChild, ok := child.(*tree); ok {
+		return nativeChild.setQuery(rest, procs)
 	}
+
 	return child.Set(NewDirective(rest.localPath(), procs...))
 }
 
@@ -186,6 +195,7 @@ func (t *tree) Get(path string) ([]byte, error) {
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
+
 	return t.getLocal(nil, path, false)
 }
 
@@ -200,9 +210,11 @@ func (t *tree) getLocal(rc *driver.RealizeContext, path string, contextual bool)
 		if errors.Is(err, errMountChanged) {
 			continue
 		}
+
 		if err != nil {
 			return nil, err
 		}
+
 		var value []byte
 		if contextual {
 			if rc != nil && version != 0 {
@@ -212,6 +224,7 @@ func (t *tree) getLocal(rc *driver.RealizeContext, path string, contextual bool)
 		} else {
 			value, err = t.getWithParent(content, version, q, binding)
 		}
+
 		if !errors.Is(err, errMountChanged) {
 			return value, err
 		}
@@ -226,12 +239,14 @@ func (t *tree) ancestorContent(rc *driver.RealizeContext, binding *treeMount) ([
 		node    *tree
 		binding *treeMount
 	}
+
 	var ancestors []snapshot
 	for link := binding; link != nil; {
 		parent := link.parent
 		link = parent.mount.Load()
 		ancestors = append(ancestors, snapshot{parent, link})
 	}
+
 	var content []byte
 	var version uint64
 	for i := len(ancestors) - 1; i >= 0; i-- {
@@ -239,11 +254,13 @@ func (t *tree) ancestorContent(rc *driver.RealizeContext, binding *treeMount) ([
 		if err := ancestor.node.realizeWithParentCtx(rc, content, version, ancestor.binding); err != nil {
 			return nil, 0, fmt.Errorf("realize ancestor at %q: %w", ancestor.node.Path(), err)
 		}
+
 		content, version = ancestor.node.getWithVersion()
 		if ancestor.node.mount.Load() != ancestor.binding {
 			return nil, 0, errMountChanged
 		}
 	}
+
 	return content, version, nil
 }
 
@@ -265,6 +282,7 @@ func newPathQuery(d driver.Driver, path string) pathQuery {
 			return pathQuery{path: path, driver: d, segs: segs, parsed: true}
 		}
 	}
+
 	return pathQuery{path: path, driver: d}
 }
 
@@ -273,6 +291,7 @@ func (q pathQuery) level() int {
 	if q.parsed {
 		return len(q.segs)
 	}
+
 	return q.driver.GetLevel(q.path)
 }
 
@@ -283,13 +302,17 @@ func (q pathQuery) name(level int) string {
 		if level < 1 || level > len(q.segs) {
 			return ""
 		}
+
 		return q.segs[level-1]
 	}
+
 	return q.driver.GetNameByLevel(q.path, level)
 }
 
-func (q pathQuery) done() bool   { return q.pos == q.level() }
+func (q pathQuery) done() bool { return q.pos == q.level() }
+
 func (q pathQuery) head() string { return q.name(q.pos + 1) }
+
 func (q pathQuery) next() pathQuery {
 	q.pos++
 	return q
@@ -302,6 +325,7 @@ func (q pathQuery) localPath() string {
 	for i := q.pos + 1; i <= q.level(); i++ {
 		path = q.driver.AppendPath(path, q.name(i))
 	}
+
 	return path
 }
 
@@ -317,6 +341,7 @@ func (t *tree) getWithParent(parentContent []byte, parentVer uint64, q pathQuery
 			value, err = nil, errMountChanged
 		}
 	}()
+
 	// Only the static prefix of the chain is realized into the cache;
 	// the dynamic layer needs request params and is skipped here.
 	if err := t.realizeWithParent(parentContent, parentVer, binding); err != nil {
@@ -333,15 +358,17 @@ func (t *tree) getWithParent(parentContent []byte, parentVer uint64, q pathQuery
 		// outdated parent realization (issue #48)
 		content, ver := t.getWithVersion()
 		rest := q.next()
-		if ct, ok := child.(*tree); ok {
-			childBinding, err := queryMount(ct, t, q.head())
+		if nativeChild, ok := child.(*tree); ok {
+			childBinding, err := queryMount(nativeChild, t, q.head())
 			if err != nil {
 				return nil, err
 			}
-			return ct.getWithParent(content, ver, rest, childBinding)
+			return nativeChild.getWithParent(content, ver, rest, childBinding)
 		}
+
 		return child.Get(rest.localPath())
 	}
+
 	return t.doFallback(nil, t.get())
 }
 
@@ -361,6 +388,7 @@ func (t *tree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, e
 	if t == nil {
 		return nil, ErrNotExistsTree
 	}
+
 	return t.getLocal(rc, path, true)
 }
 
@@ -372,6 +400,7 @@ func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []b
 			value, err = nil, errMountChanged
 		}
 	}()
+
 	if rc != nil {
 		rc.TreePath = t.Path()
 	}
@@ -392,19 +421,23 @@ func (t *tree) getContextWithParent(rc *driver.RealizeContext, parentContent []b
 		if rc != nil {
 			rc.ParentContent = content
 		}
+
 		rest := q.next()
-		if ct, ok := child.(*tree); ok {
-			childBinding, err := queryMount(ct, t, q.head())
+		if nativeChild, ok := child.(*tree); ok {
+			childBinding, err := queryMount(nativeChild, t, q.head())
 			if err != nil {
 				return nil, err
 			}
-			return ct.getContextWithParent(rc, content, ver, rest, childBinding)
+			return nativeChild.getContextWithParent(rc, content, ver, rest, childBinding)
 		}
+
 		if rc != nil {
 			rc.TreePath = q.driver.AppendPath(t.Path(), q.head())
 		}
+
 		return child.GetWithContext(rc, rest.localPath())
 	}
+
 	return t.doFallback(rc, t.get())
 }
 
@@ -432,12 +465,14 @@ func (t *tree) dynamicRealize(rc *driver.RealizeContext) ([]byte, error) {
 	if len(dynamic) == 0 {
 		return content, nil // fully static chain: nothing to do per request
 	}
+
 	content = slices.Clone(content)
 	rc = t.processorContext(rc)
 	content, err := t.driver.Realize(rc, content, dynamic...)
 	if err != nil {
 		return nil, fmt.Errorf("realize dynamic rule on %s fail: %w", t.Path(), err)
 	}
+
 	return content, nil
 }
 
@@ -446,6 +481,7 @@ func (t *tree) doFallback(rc *driver.RealizeContext, content []byte) ([]byte, er
 	if fb := t.fallback.Load(); fb != nil {
 		return (*fb).Process(t.processorContext(rc), slices.Clone(content))
 	}
+
 	return content, nil
 }
 
@@ -459,6 +495,7 @@ func (t *tree) SetFallback(proc driver.Processor) {
 	} else {
 		t.fallback.Store(&proc)
 	}
+
 	for _, child := range t.getChildren() {
 		child.SetFallback(proc)
 	}
@@ -482,17 +519,21 @@ func (t *tree) hasQuery(q pathQuery) bool {
 		// Preserve the existing named-root Has("/") behavior.
 		return q.pos > 0 || t.name == ""
 	}
+
 	child := t.pickChild(q.head())
 	if child == nil {
 		return false
 	}
+
 	rest := q.next()
 	if rest.done() {
 		return true
 	}
-	if ct, ok := child.(*tree); ok {
-		return ct.hasQuery(rest)
+
+	if nativeChild, ok := child.(*tree); ok {
+		return nativeChild.hasQuery(rest)
 	}
+
 	return child.Has(rest.localPath())
 }
 
@@ -505,31 +546,37 @@ func (t *tree) delQuery(q pathQuery) error {
 	if q.done() {
 		return fmt.Errorf("root node can not be deleted")
 	}
+
 	rest := q.next()
 	if rest.done() {
 		return t.deleteNode(q.head())
 	}
+
 	if child := t.pickChild(q.head()); child != nil {
-		if ct, ok := child.(*tree); ok {
-			return ct.delQuery(rest)
+		if nativeChild, ok := child.(*tree); ok {
+			return nativeChild.delQuery(rest)
 		}
+
 		return child.Del(rest.localPath())
 	}
+
 	return nil
 }
 
-// ShowStruct return tree struct.
+// ShowStruct returns the tree structure as JSON.
 func (t *tree) ShowStruct() []byte {
 	t.mu.RLock()
 	children := make(map[string]Tree, len(t.children))
 	for name, child := range t.children {
 		children[name] = child
 	}
+
 	t.mu.RUnlock()
 	m := make(map[string]json.RawMessage, len(children))
 	for name, child := range children {
 		m[name] = child.ShowStruct()
 	}
+
 	d, _ := json.Marshal(m)
 	return d
 }
@@ -538,11 +585,14 @@ func (t *tree) ShowStruct() []byte {
 func (t *tree) deleteNode(name string) error {
 	unlock := lockTopologyRoots(t)
 	defer unlock()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if old, ok := t.children[name].(*tree); ok {
 		old.mount.Store(nil)
 	}
+
 	delete(t.children, name)
 	return nil
 }
@@ -553,20 +603,25 @@ func (t *tree) getChild(name string) (Tree, error) {
 	if child := t.pickChild(name); child != nil {
 		return child, nil
 	}
+
 	// Recheck while inserting so concurrent Set calls cannot replace each
 	// other's newly created intermediate nodes. No processor runs here.
 	unlock := lockTopologyRoots(t)
 	defer unlock()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if child := t.children[name]; child != nil {
 		return child, nil
 	}
+
 	// Validate under the same topology lock as insertion: the receiver may
 	// have moved beneath a different path grammar while Set was resolving.
 	if !validNativeName(t, name) {
 		return nil, fmt.Errorf("node name %q is incompatible with enclosing path syntax", name)
 	}
+
 	child := t.newSubTree(name)
 	t.children[name] = child
 	return child, nil
@@ -575,9 +630,11 @@ func (t *tree) getChild(name string) (Tree, error) {
 func (t *tree) getChildren() (children []Tree) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+
 	for _, v := range t.children {
 		children = append(children, v)
 	}
+
 	return children
 }
 
@@ -586,6 +643,7 @@ func (t *tree) getChildren() (children []Tree) {
 func (t *tree) pickChild(name string) Tree {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+
 	return t.children[name]
 }
 
@@ -620,6 +678,7 @@ func (t *tree) newSubTree(name string) Tree {
 		realizedFrom: parentVer,
 		children:     make(map[string]Tree),
 	}
+
 	// inherit the management fields through their atomic slots (issue #47:
 	// plain field copies raced SetFallback/SetDefaultContext)
 	child.mount.Store(&treeMount{parent: t, name: name})
@@ -642,6 +701,7 @@ func (t *tree) newSubTree(name string) Tree {
 func (t *tree) apply(procs ...driver.Processor) error {
 	t.realizeMu.Lock()
 	defer t.realizeMu.Unlock()
+
 	t.procs = procs
 	t.dynamicFrom = dynamicSplit(procs)
 	// invalidateCache, inlined to stay in the same critical section:
@@ -652,6 +712,7 @@ func (t *tree) apply(procs ...driver.Processor) error {
 	if t.lazyMode || t.pendingBase() {
 		return nil
 	}
+
 	// standard mode: realize only the static prefix at build time; the
 	// dynamic layer is applied per query in GetWithContext. The chain is
 	// realized from the node's own base, which captures the parent
@@ -667,6 +728,7 @@ func dynamicSplit(procs []driver.Processor) int {
 		if proc == nil {
 			continue
 		}
+
 		// IsParamAware also looks through *CombinedProcessor chains, so a
 		// combined chain containing a param-aware processor stays in the
 		// dynamic layer instead of caching request-specific output.
@@ -674,6 +736,7 @@ func dynamicSplit(procs []driver.Processor) int {
 			return i
 		}
 	}
+
 	return len(procs)
 }
 
@@ -692,6 +755,7 @@ func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []b
 	if rc == nil {
 		rc = t.defaultCtx.Load()
 	}
+
 	// Fast path: read lock checks whether realization can be skipped.
 	// The processor chain is NOT read here — it lives under the write
 	// lock only, so the hot cached path stays free of chain access.
@@ -706,18 +770,22 @@ func (t *tree) realizeWithParentCtx(rc *driver.RealizeContext, parentContent []b
 		t.realizeMu.RUnlock()
 		return errMountChanged
 	}
+
 	if t.fresh(parentVer) {
 		t.realizeMu.RUnlock()
 		return nil
 	}
+
 	t.realizeMu.RUnlock()
 
 	// Slow path: write lock performs the actual realization.
 	t.realizeMu.Lock()
 	defer t.realizeMu.Unlock()
+
 	if t.mount.Load() != binding {
 		return errMountChanged
 	}
+
 	// Double-check after acquiring the write lock, so concurrent goroutines
 	// that passed the fast path do not realize twice.
 	if t.fresh(parentVer) {
@@ -736,9 +804,11 @@ func (t *tree) fresh(parentVer uint64) bool {
 	if t.instantMode || t.realizedAt.IsZero() {
 		return false
 	}
+
 	if t.cacheTTL != 0 && time.Since(t.realizedAt) >= t.cacheTTL {
 		return false
 	}
+
 	return parentVer <= t.realizedFrom
 }
 
@@ -765,6 +835,7 @@ func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte, pa
 		t.base = base
 		t.contentMu.Unlock()
 	}
+
 	base = slices.Clone(base)
 	rc = t.processorContext(rc)
 	if rc != nil && parentVer != 0 {
@@ -775,6 +846,7 @@ func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte, pa
 	if err != nil {
 		return fmt.Errorf("realize rule fail: %w", err)
 	}
+
 	t.set(rule)
 	t.realizedFrom = parentVer
 
@@ -786,6 +858,7 @@ func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte, pa
 func (t *tree) set(rule []byte) {
 	t.contentMu.Lock()
 	defer t.contentMu.Unlock()
+
 	t.content = rule
 	t.contentVer++ // a new publication for descendants' staleness checks
 }
@@ -796,6 +869,7 @@ func (t *tree) set(rule []byte) {
 func (t *tree) getWithVersion() (content []byte, version uint64) {
 	t.contentMu.RLock()
 	defer t.contentMu.RUnlock()
+
 	return t.content, t.contentVer
 }
 
@@ -803,6 +877,7 @@ func (t *tree) getWithVersion() (content []byte, version uint64) {
 func (t *tree) get() (rule []byte) {
 	t.contentMu.RLock()
 	defer t.contentMu.RUnlock()
+
 	return t.content
 }
 
@@ -810,6 +885,7 @@ func (t *tree) get() (rule []byte) {
 func (t *tree) getBase() (base []byte) {
 	t.contentMu.RLock()
 	defer t.contentMu.RUnlock()
+
 	return t.base
 }
 
