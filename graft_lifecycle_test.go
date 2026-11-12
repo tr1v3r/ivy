@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tr1v3r/ivy/driver"
 )
@@ -210,14 +212,10 @@ func TestGraft_ConcurrentMutationsCreateOneSharedBranch(t *testing.T) {
 	}
 
 	start := make(chan struct{})
-	errs := make(chan error, workers)
-	var wg sync.WaitGroup
+	tasks := make([]*topologyTestTask, 0, workers)
 
 	for worker := 0; worker < workers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		tasks = append(tasks, startTopologyTestTask(func() error {
 			<-start
 			// Both the outer root and retained source handle must create nodes
 			// in the same shared branch, rather than replacing each other's map.
@@ -235,18 +233,21 @@ func TestGraft_ConcurrentMutationsCreateOneSharedBranch(t *testing.T) {
 				err = receiver.Set(NewDirective(path, appendProc(fmt.Sprintf("-%d", worker))))
 			}
 
-			if err != nil {
-				errs <- err
-			}
-		}()
+			return err
+		}))
 	}
 
 	close(start)
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		t.Error(err)
+	complete := true
+	for _, task := range tasks {
+		err, ok := task.await(t, "concurrent shared-branch mutation")
+		complete = complete && ok
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if !complete {
+		return
 	}
 
 	for worker := 0; worker < workers; worker++ {
@@ -281,53 +282,44 @@ func TestGraft_ConcurrentReplacementAndReads(t *testing.T) {
 
 	const readers = 4
 	start := make(chan struct{})
-	errs := make(chan error, readers+1)
-	var wg sync.WaitGroup
+	tasks := make([]*topologyTestTask, 0, readers+1)
 
-	for worker := 0; worker < readers; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+	for range readers {
+		tasks = append(tasks, startTopologyTestTask(func() error {
 			<-start
-
-			for i := 0; i < 300; i++ {
+			for range 300 {
 				got, err := dst.Get("/mount/leaf")
 				if err != nil {
-					errs <- fmt.Errorf("replacement read failed: %w", err)
-					return
+					return fmt.Errorf("replacement read failed: %w", err)
 				}
 
 				if string(got) != "D-A-a" && string(got) != "D-B-b" {
-					errs <- fmt.Errorf("read observed incomplete replacement: %q", got)
-					return
+					return fmt.Errorf("read observed incomplete replacement: %q", got)
 				}
 			}
-		}()
+
+			return nil
+		}))
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	tasks = append(tasks, startTopologyTestTask(func() error {
 		<-start
-
 		for _, src := range sources[1:] {
-			// Each source is used exactly once: no concurrent ownership transfer
-			// or accidental remount of a source still attached elsewhere.
+			// Each source is used exactly once; public same-source transfer and
+			// retry behavior is covered by PublicQueriesRetryAcrossRemount.
 			if err := dst.Graft("/mount", src); err != nil {
-				errs <- fmt.Errorf("replacement failed: %w", err)
-				return
+				return fmt.Errorf("replacement failed: %w", err)
 			}
 		}
-	}()
+
+		return nil
+	}))
 
 	close(start)
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		t.Error(err)
+	for _, task := range tasks {
+		if err, ok := task.await(t, "concurrent replacement and read"); ok && err != nil {
+			t.Error(err)
+		}
 	}
 }
 
@@ -396,6 +388,317 @@ func TestGraft_AttachedCallbackRejectsDuplicateOwnership(t *testing.T) {
 	}
 }
 
+func awaitGraftSignal(t *testing.T, signal <-chan struct{}, label string) bool {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-signal:
+		return true
+	case <-timer.C:
+		t.Errorf("%s did not finish", label)
+		return false
+	}
+}
+
+func TestGraft_ParentChainPublicationWithConcurrentContextReads(t *testing.T) {
+	const path = "/x/y/z/api/leaf"
+	root := graftTestTree(t, "standard", "P ${user}")
+	capture := &driver.RawProcessor{Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
+		if rc.TreePath != path || string(rc.ParentContent) != "P ${user}-s" {
+			return nil, fmt.Errorf("published-chain metadata = %q/%q", rc.TreePath, rc.ParentContent)
+		}
+
+		return before, nil
+	}}
+	source := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", appendProc("-s")),
+		NewDirective("/leaf", appendProc("-l"), &driver.TemplateProcessor{}, capture))
+
+	// Stop Graft at cache preparation: missing parents have been constructed,
+	// but the final source edge has not been attached. No test hook is needed.
+	source.contentMu.Lock()
+	releaseContent := sync.OnceFunc(source.contentMu.Unlock)
+	var tasks []*topologyTestTask
+	defer func() {
+		releaseContent()
+		for _, task := range tasks {
+			if !task.collected {
+				if err, ok := task.await(t, "parent publication cleanup"); ok && err != nil {
+					t.Error(err)
+				}
+			}
+		}
+	}()
+
+	graftTask := startTopologyTestTask(func() error { return root.Graft("/x/y/z/api", source) })
+	tasks = append(tasks, graftTask)
+	deadline := time.Now().Add(5 * time.Second)
+	for !source.basePending.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("Graft did not reach cache preparation")
+		}
+
+		runtime.Gosched()
+	}
+
+	// This observable partial-publication window must still be protected by
+	// the original parent's write lock, not merely by the topology mutex.
+	if root.mu.TryRLock() {
+		root.mu.RUnlock()
+		t.Fatal("readers can enter the new parent chain before source attachment")
+	}
+
+	readers := []*topologyTestTask{startTopologyTestTask(func() error {
+		if !root.Has(path) {
+			return fmt.Errorf("Has observed a parent chain without its source")
+		}
+
+		return nil
+	})}
+	for _, user := range []string{"alice", "bob"} {
+		readers = append(readers, startTopologyTestTask(func() error {
+			rc := paramRC(map[string]string{"user": user})
+			got, err := root.GetWithContext(rc, path)
+			if err != nil {
+				return fmt.Errorf("concurrent published query %s: %w", user, err)
+			}
+			if string(got) != "P "+user+"-s-l" {
+				return fmt.Errorf("concurrent published query %s = %q", user, got)
+			}
+
+			return nil
+		}))
+	}
+	tasks = append(tasks, readers...)
+	for _, reader := range readers {
+		if !awaitGraftSignal(t, reader.started, "publication reader started") {
+			return
+		}
+	}
+
+	releaseContent()
+	complete := true
+	for _, task := range tasks {
+		err, ok := task.await(t, "complete parent chain and concurrent readers")
+		complete = complete && ok
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if complete {
+		graftTestGet(t, root, path, "P ${user}-s-l")
+	}
+}
+
+func TestGraft_PublicQueriesRetryAcrossRemount(t *testing.T) {
+	for _, contextual := range []bool{false, true} {
+		for _, leafReceiver := range []bool{false, true} {
+			t.Run(fmt.Sprintf("context=%v/leaf=%v", contextual, leafReceiver), func(t *testing.T) {
+				const mountedPath = "/new/deep/slot"
+				oldEntered, releaseOld := make(chan struct{}), make(chan struct{})
+				freshEntered, releaseFresh := make(chan struct{}), make(chan struct{})
+				unblockOld := sync.OnceFunc(func() { close(releaseOld) })
+				unblockFresh := sync.OnceFunc(func() { close(releaseFresh) })
+				markOld := sync.OnceFunc(func() { close(oldEntered) })
+				markFresh := sync.OnceFunc(func() { close(freshEntered) })
+				var blockOld atomic.Bool
+				a := graftTestTree(t, "instant", "A ${user}", NewDirective("/", &driver.RawProcessor{
+					Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
+						if blockOld.Load() {
+							markOld()
+							<-releaseOld
+						}
+
+						return before, nil
+					},
+				}))
+				for range 10 {
+					graftTestGet(t, a, "/", "A ${user}")
+				}
+				_, oldVersion := a.getWithVersion()
+
+				var sourceRuns atomic.Int32
+				capture := &driver.RawProcessor{Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
+					if rc.TreePath != mountedPath+"/leaf" || string(rc.ParentContent) != "B ${user}-s" {
+						return nil, fmt.Errorf("dynamic metadata = %q/%q", rc.TreePath, rc.ParentContent)
+					}
+
+					if rc.Params["user"] == "fresh" {
+						markFresh()
+						<-releaseFresh
+					}
+
+					return before, nil
+				}}
+				source := graftTestTree(t, "lazy", "SOURCE",
+					NewDirective("/", graftTestCountProc(&sourceRuns, "-s")),
+					NewDirective("/leaf", appendProc("-l"), &driver.TemplateProcessor{}, capture))
+				if err := a.Graft("/slot", source); err != nil {
+					t.Fatal(err)
+				}
+
+				b := graftTestTree(t, "standard", "B ${user}")
+				receiver, path := Tree(source), "/leaf"
+				if leafReceiver {
+					receiver, path = source.pickChild("leaf"), "/"
+				}
+
+				var oldTask, moveTask, freshTask *topologyTestTask
+				defer func() {
+					unblockOld()
+					unblockFresh()
+					for _, task := range []*topologyTestTask{oldTask, moveTask, freshTask} {
+						if task != nil && !task.collected {
+							if err, ok := task.await(t, "remount query cleanup"); ok && err != nil {
+								t.Error(err)
+							}
+						}
+					}
+				}()
+
+				oldRC := paramRC(map[string]string{"user": "old"})
+				blockOld.Store(true)
+				oldTask = startTopologyTestTask(func() error {
+					var got []byte
+					var err error
+					want := "B ${user}-s-l"
+					if contextual {
+						got, err = receiver.GetWithContext(oldRC, path)
+						want = "B old-s-l"
+					} else {
+						got, err = receiver.Get(path)
+					}
+
+					if err != nil {
+						return fmt.Errorf("public remount read: %w", err)
+					}
+					if string(got) != want {
+						return fmt.Errorf("public remount read = %q; want %q", got, want)
+					}
+
+					return nil
+				})
+				if !awaitGraftSignal(t, oldEntered, "query reaching the old parent") {
+					return
+				}
+
+				moveTask = startTopologyTestTask(func() error {
+					if err := a.Del("/slot"); err != nil {
+						return err
+					}
+
+					return b.Graft(mountedPath, source)
+				})
+				if err, ok := moveTask.await(t, "source remount while old query is suspended"); !ok || err != nil {
+					t.Errorf("remount: %v", err)
+					return
+				}
+
+				freshTask = startTopologyTestTask(func() error {
+					got, err := b.GetWithContext(paramRC(map[string]string{"user": "fresh"}), mountedPath+"/leaf")
+					if err != nil {
+						return fmt.Errorf("new-parent query: %w", err)
+					}
+					if string(got) != "B fresh-s-l" {
+						return fmt.Errorf("new-parent query = %q", got)
+					}
+
+					return nil
+				})
+				if !awaitGraftSignal(t, freshEntered, "new parent cached with a concurrent dynamic query") {
+					return
+				}
+
+				unblockOld()
+				if err, ok := oldTask.await(t, "public query retry on the new parent"); !ok || err != nil {
+					t.Errorf("retried query: %v", err)
+					return
+				}
+				unblockFresh()
+				if err, ok := freshTask.await(t, "concurrent parameter query"); !ok || err != nil {
+					t.Errorf("fresh query: %v", err)
+					return
+				}
+
+				if contextual && (oldRC.TreePath != mountedPath+"/leaf" || string(oldRC.ParentContent) != "B ${user}-s" || oldRC.Params["user"] != "old") {
+					t.Fatalf("retried context = %#v", oldRC)
+				}
+				if source.realizedFrom >= oldVersion || sourceRuns.Load() != 1 {
+					t.Fatal("old parent's high version overwrote or re-realized the new parent cache")
+				}
+
+				graftTestGet(t, b, mountedPath+"/leaf", "B ${user}-s-l")
+				got, err := source.GetWithContext(paramRC(map[string]string{"user": "last"}), "/leaf")
+				if err != nil || string(got) != "B last-s-l" {
+					t.Fatalf("parameter-isolated cache after remount = %q, %v", got, err)
+				}
+			})
+		}
+	}
+}
+
+func TestGraft_PublicQueryRetriesAncestorDetach(t *testing.T) {
+	for _, contextual := range []bool{false, true} {
+		t.Run(fmt.Sprint(contextual), func(t *testing.T) {
+			root := graftTestTree(t, "standard", "A")
+			var runs atomic.Int32
+			source := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", &driver.RawProcessor{
+				Proc: func(_ *driver.RealizeContext, before []byte) ([]byte, error) {
+					runs.Add(1)
+					if err := root.Del("/slot"); err != nil {
+						return nil, err
+					}
+
+					return append(before, "-s"...), nil
+				},
+			}), NewDirective("/leaf", appendProc("-l")))
+			if err := root.Graft("/slot", source); err != nil {
+				t.Fatal(err)
+			}
+
+			leaf := source.pickChild("leaf")
+			var got []byte
+			var err error
+			if contextual {
+				got, err = leaf.GetWithContext(paramRC(nil), "/")
+			} else {
+				got, err = leaf.Get("/")
+			}
+
+			if err != nil || string(got) != "A-s-l" || runs.Load() != 1 || source.Path() != "" || root.Has("/slot") {
+				t.Fatalf("read after ancestor detached itself = %q, %v; runs=%d path=%q", got, err, runs.Load(), source.Path())
+			}
+		})
+	}
+}
+
+func TestGraft_PublicQueryPropagatesAncestorError(t *testing.T) {
+	wantErr := errors.New("ancestor failed")
+	for _, contextual := range []bool{false, true} {
+		t.Run(fmt.Sprint(contextual), func(t *testing.T) {
+			root := graftTestTree(t, "lazy", "A", NewDirective("/", &driver.RawProcessor{
+				Proc: func(_ *driver.RealizeContext, _ []byte) ([]byte, error) { return nil, wantErr },
+			}))
+			source := graftTestTree(t, "lazy", "SOURCE")
+			if err := root.Graft("/slot", source); err != nil {
+				t.Fatal(err)
+			}
+
+			var err error
+			if contextual {
+				_, err = source.GetWithContext(paramRC(nil), "/")
+			} else {
+				_, err = source.Get("/")
+			}
+
+			if !errors.Is(err, wantErr) || !source.basePending.Load() {
+				t.Fatalf("ancestor error = %v; source pending=%v", err, source.basePending.Load())
+			}
+		})
+	}
+}
+
 func TestGraft_StaleCarryCannotPublishAfterRemount(t *testing.T) {
 	for _, contextual := range []bool{false, true} {
 		t.Run(map[bool]string{false: "Get", true: "GetWithContext"}[contextual], func(t *testing.T) {
@@ -459,19 +762,21 @@ func TestGraft_ConcurrentSetAndTransferPreserveUpdates(t *testing.T) {
 		}
 
 		start := make(chan struct{})
-		setDone, graftDone := make(chan error, 1), make(chan error, 1)
-		go func() {
+		setTask := startTopologyTestTask(func() error {
 			<-start
-			setDone <- source.Set(NewDirective(".leaf", appendProc("-leaf")))
-		}()
-
-		go func() {
+			return source.Set(NewDirective(".leaf", appendProc("-leaf")))
+		})
+		graftTask := startTopologyTestTask(func() error {
 			<-start
-			graftDone <- root.Graft("/slot", source)
-		}()
+			return root.Graft("/slot", source)
+		})
 
 		close(start)
-		setErr, graftErr := <-setDone, <-graftDone
+		setErr, setOK := setTask.await(t, "Set racing with source transfer")
+		graftErr, graftOK := graftTask.await(t, "source transfer racing with Set")
+		if !setOK || !graftOK {
+			return
+		}
 		if setErr != nil || graftErr != nil {
 			t.Fatalf("concurrent Set/Graft errors = %v/%v", setErr, graftErr)
 		}

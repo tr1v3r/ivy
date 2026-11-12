@@ -2,6 +2,7 @@ package ivy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -351,13 +352,14 @@ func TestGraft_SourceTargetDispatchMatrix(t *testing.T) {
 	}
 }
 
-// This target forwards synchronously into a separate native root. Checking
-// TryLock before forwarding turns a retained-lock regression into an error,
-// rather than letting the test hang while the forwarded Graft reacquires it.
+// This target rejects or forwards synchronously into a separate native root.
+// Checking TryLock before dispatch turns a retained-lock regression into an
+// error, rather than hanging when a forwarded Graft reacquires it.
 type graftDispatchForwardingTarget struct {
 	*graftTestForeignTree
 	outerRoot       *tree
 	innerRoot       *tree
+	rejectErr       error
 	expectedContent []byte
 	expectedVersion uint64
 	locksReleased   bool
@@ -394,63 +396,156 @@ func (target *graftDispatchForwardingTarget) Graft(path string, source Tree) err
 
 	target.locksReleased = true
 
+	if target.rejectErr != nil {
+		return target.rejectErr
+	}
+
 	return target.innerRoot.Graft(path, source)
 }
 
-func TestGraft_CustomTargetCanForwardAfterLocksReleased(t *testing.T) {
+func TestGraft_CustomTargetRejectionLeavesSourceUnchanged(t *testing.T) {
 	for _, sourceKind := range []string{"native", "custom"} {
 		t.Run(sourceKind+"_source", func(t *testing.T) {
 			outerRoot := graftTestTree(t, "standard", "OUTER", NewDirective("/parent"))
-			innerRoot := graftTestTree(t, "standard", "INNER", NewDirective("/branch"))
-			previous := graftTestTree(t, "lazy", "PREVIOUS")
 			source := graftDispatchSource(t, sourceKind == "native")
-
-			if err := innerRoot.Graft("/branch/slot", previous); err != nil {
-				t.Fatal(err)
-			}
-
+			rejection := errors.New("custom target rejected graft")
 			target := &graftDispatchForwardingTarget{
 				graftTestForeignTree: newGraftTestForeignTree(),
 				outerRoot:            outerRoot,
-				innerRoot:            innerRoot,
+				rejectErr:            rejection,
 			}
 
+			checkSource := func() {
+				if len(source.(*graftTestForeignTree).calls) != 0 {
+					t.Fatal("rejected graft invoked custom source operations")
+				}
+			}
 			if nativeSource, ok := source.(*tree); ok {
-				target.expectedContent, target.expectedVersion = nativeSource.getWithVersion()
-				target.expectedContent = bytes.Clone(target.expectedContent)
+				// Give the detached source a nonzero inherited publication and
+				// distinct runtime objects, so invalidation cannot hide in zero values.
+				previousRoot := graftTestTree(t, "standard", "PREVIOUS")
+				if err := previousRoot.Graft("/old", source); err != nil {
+					t.Fatal(err)
+				}
+				graftTestGet(t, previousRoot, "/old/leaf", "PREVIOUS-source")
+				if err := previousRoot.Del("/old"); err != nil {
+					t.Fatal(err)
+				}
+				source.SetDefaultContext(paramRC(map[string]string{"source": "retained"}))
+				source.SetRateLimit(rate.Inf, 1)
+
+				content, version := nativeSource.getWithVersion()
+				content, base := bytes.Clone(content), bytes.Clone(nativeSource.getBase())
+				realizedFrom, realizedAt := nativeSource.realizedFrom, nativeSource.realizedAt
+				pending, mount := nativeSource.basePending.Load(), nativeSource.mount.Load()
+				sourceDriver, context, limiter := nativeSource.driver, nativeSource.defaultCtx.Load(), nativeSource.rateLimiter
+				target.expectedContent, target.expectedVersion = content, version
+				checkSource = func() {
+					current, currentVersion := nativeSource.getWithVersion()
+					if !bytes.Equal(current, content) || currentVersion != version || !bytes.Equal(nativeSource.getBase(), base) ||
+						nativeSource.realizedFrom != realizedFrom || nativeSource.realizedAt != realizedAt || nativeSource.basePending.Load() != pending {
+						t.Fatal("custom rejection changed native source cache, base or realization state")
+					}
+					if nativeSource.mount.Load() != mount || nativeSource.Path() != "" || nativeSource.driver != sourceDriver ||
+						nativeSource.defaultCtx.Load() != context || nativeSource.rateLimiter != limiter {
+						t.Fatal("custom rejection changed native source ownership or runtime objects")
+					}
+				}
 			}
 
 			if err := outerRoot.Graft("/parent/boundary", target); err != nil {
 				t.Fatal(err)
 			}
-
-			if err := outerRoot.Graft("/parent/boundary/branch/slot", source); err != nil {
-				t.Fatal(err)
+			before := bytes.Clone(outerRoot.ShowStruct())
+			if err := outerRoot.Graft("/parent/boundary/new//deep/slot", source); !errors.Is(err, rejection) {
+				t.Fatalf("custom rejection = %v; want unchanged sentinel %v", err, rejection)
 			}
-
-			if !target.locksReleased || target.calls["Graft"] != "/branch/slot" || target.graftSource != source {
-				t.Fatalf("custom forwarding target received path %q, source %p, locks released %v", target.calls["Graft"], target.graftSource, target.locksReleased)
+			if !target.locksReleased || target.calls["Graft"] != "/new//deep/slot" || target.graftSource != source {
+				t.Fatalf("rejecting target received path %q, source %p, locks released %v", target.calls["Graft"], target.graftSource, target.locksReleased)
 			}
-
-			branch := innerRoot.pickChild("branch").(*tree)
-			if branch.pickChild("slot") != source {
-				t.Fatal("forwarding into the independent native root lost source identity")
+			if !bytes.Equal(outerRoot.ShowStruct(), before) || outerRoot.pickChild("parent").(*tree).pickChild("boundary") != target {
+				t.Fatal("custom rejection changed outer native prefixes or the boundary edge")
 			}
+			checkSource()
+		})
+	}
+}
 
-			if previous.mount.Load() != nil || previous.Path() != "" {
-				t.Fatal("forwarded replacement did not detach the previous native child")
-			}
+func TestGraft_CustomTargetCanForwardAfterLocksReleased(t *testing.T) {
+	for _, sourceKind := range []string{"native", "custom"} {
+		for _, path := range []string{"/branch/slot", "/new/deep/slot"} {
+			t.Run(sourceKind+"_source"+path, func(t *testing.T) {
+				outerRoot := graftTestTree(t, "standard", "OUTER", NewDirective("/parent"))
+				innerRoot := graftTestTree(t, "standard", "INNER", NewDirective("/branch"))
+				source := graftDispatchSource(t, sourceKind == "native")
 
-			if nativeSource, ok := source.(*tree); ok {
-				if nativeSource.Path() != "/branch/slot" {
-					t.Fatalf("forwarded native source Path = %q", nativeSource.Path())
+				var previous *tree
+				if path == "/branch/slot" {
+					previous = graftTestTree(t, "lazy", "PREVIOUS")
+					if err := innerRoot.Graft(path, previous); err != nil {
+						t.Fatal(err)
+					}
+				} else if innerRoot.Has("/new") {
+					t.Fatal("forwarding setup unexpectedly contains the missing parents")
 				}
 
-				graftTestGet(t, innerRoot, "/branch/slot/leaf", "INNER-source")
-			} else if len(source.(*graftTestForeignTree).calls) != 0 {
-				t.Fatal("custom-source forwarding invoked source operations")
-			}
-		})
+				target := &graftDispatchForwardingTarget{
+					graftTestForeignTree: newGraftTestForeignTree(),
+					outerRoot:            outerRoot,
+					innerRoot:            innerRoot,
+				}
+
+				if nativeSource, ok := source.(*tree); ok {
+					target.expectedContent, target.expectedVersion = nativeSource.getWithVersion()
+					target.expectedContent = bytes.Clone(target.expectedContent)
+				}
+
+				if err := outerRoot.Graft("/parent/boundary", target); err != nil {
+					t.Fatal(err)
+				}
+
+				if err := outerRoot.Graft("/parent/boundary"+path, source); err != nil {
+					t.Fatal(err)
+				}
+
+				if !target.locksReleased || target.calls["Graft"] != path || target.graftSource != source {
+					t.Fatalf("custom forwarding target received path %q, source %p, locks released %v", target.calls["Graft"], target.graftSource, target.locksReleased)
+				}
+
+				parent := innerRoot.pickChild("branch").(*tree)
+				if path == "/new/deep/slot" {
+					parent = innerRoot
+					for _, name := range []string{"new", "deep"} {
+						child, ok := parent.pickChild(name).(*tree)
+						if !ok {
+							t.Fatalf("forwarding did not create native parent %q", name)
+						}
+						if child.Path() != parent.Path()+"/"+name || len(child.procs) != 0 || child.driver != innerRoot.driver {
+							t.Fatalf("forwarded parent %q has incorrect path, processors or driver", name)
+						}
+						parent = child
+					}
+					graftTestGet(t, innerRoot, "/new/deep", "INNER")
+				}
+				if parent.pickChild("slot") != source {
+					t.Fatal("forwarding into the independent native root lost source identity")
+				}
+
+				if previous != nil && (previous.mount.Load() != nil || previous.Path() != "") {
+					t.Fatal("forwarded replacement did not detach the previous native child")
+				}
+
+				if nativeSource, ok := source.(*tree); ok {
+					if nativeSource.Path() != path || nativeSource.pickChild("leaf").Path() != path+"/leaf" {
+						t.Fatalf("forwarded native source paths = %q/%q", nativeSource.Path(), nativeSource.pickChild("leaf").Path())
+					}
+
+					graftTestGet(t, innerRoot, path+"/leaf", "INNER-source")
+				} else if len(source.(*graftTestForeignTree).calls) != 0 {
+					t.Fatal("custom-source forwarding invoked source operations")
+				}
+			})
+		}
 	}
 }
 

@@ -1,6 +1,8 @@
 package ivy
 
 import (
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,8 +12,9 @@ import (
 	"github.com/tr1v3r/ivy/driver"
 )
 
-// Timers bound a broken lock implementation; ordering is established by
-// channels and deliberately held locks, never by sleeps or polling.
+// Timers bound a broken lock implementation; channels and deliberately held
+// locks establish ordering. The internal-boundary unit tests additionally observe
+// public TryLock results with bounded yielding, never sleeps or mutex internals.
 type topologyTestTask struct {
 	started   chan struct{}
 	done      chan error
@@ -43,6 +46,31 @@ func (task *topologyTestTask) await(t *testing.T, label string) (error, bool) {
 		t.Errorf("%s did not finish; possible topology-lock deadlock", label)
 
 		return nil, false
+	}
+}
+
+// awaitTopologyTestLock observes a lock acquired (or a writer queued) by the
+// sole competing goroutine. Unlike task.started, this witnesses an actual
+// internal boundary. Successful probes are immediately released.
+func awaitTopologyTestLock(t *testing.T, label string, tryLock func() bool, unlock func()) bool {
+	t.Helper()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+
+	for {
+		if !tryLock() {
+			return true
+		}
+		unlock()
+
+		select {
+		case <-timer.C:
+			t.Errorf("%s was not observed", label)
+			return false
+		default:
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -338,6 +366,136 @@ func TestNativeTopology_CompetingTargetsHaveOneSourceOwner(t *testing.T) {
 		if link == nil || link.parent != parent || link.name != "slot" || parent.pickChild("slot") != source {
 			t.Fatal("source ownership disagrees with the single successful target")
 		}
+	}
+}
+
+func TestNativeTopology_LockHelperReacquiresMovedReceiverRoot(t *testing.T) {
+	witness := graftTestTree(t, "lazy", "WITNESS")
+	oldRoot := graftTestTree(t, "lazy", "OLD")
+	// Match the production lock order without inspecting mutex internals.
+	if reflect.ValueOf(witness).Pointer() > reflect.ValueOf(oldRoot).Pointer() {
+		witness, oldRoot = oldRoot, witness
+	}
+	receiver := graftTestTree(t, "lazy", "RECEIVER")
+	if err := oldRoot.Graft("/receiver", receiver); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRoot.topologyMu.Lock()
+	releaseOld := sync.OnceFunc(oldRoot.topologyMu.Unlock)
+	acquired, release := make(chan struct{}), make(chan struct{})
+	releaseTask := sync.OnceFunc(func() { close(release) })
+	task := startTopologyTestTask(func() error {
+		unlock := lockTopologyRoots(receiver, witness)
+		defer unlock()
+		close(acquired)
+		<-release
+		return nil
+	})
+	defer func() {
+		releaseOld()
+		releaseTask()
+		if !task.collected {
+			if err, ok := task.await(t, "moved receiver cleanup"); ok && err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+
+	// All roots are snapshotted before the first lock is acquired. Seeing
+	// witness locked proves receiver was resolved to oldRoot, and the caller
+	// cannot pass oldRoot's lock until we release it. A started channel alone
+	// would not establish either fact.
+	if !awaitTopologyTestLock(t, "first root acquisition", witness.topologyMu.TryLock, witness.topologyMu.Unlock) {
+		return
+	}
+
+	// UNIT isolation: publish just the detach edge under the old topology
+	// domain and parent node lock. Public Del would recursively take the root
+	// lock we deliberately hold; no cache or realization state is changed.
+	oldRoot.mu.Lock()
+	delete(oldRoot.children, "receiver")
+	receiver.mount.Store(nil)
+	oldRoot.mu.Unlock()
+	releaseOld()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-acquired:
+	case <-timer.C:
+		t.Fatal("helper did not reacquire the moved receiver's current root")
+	}
+
+	if receiver.topologyMu.TryLock() {
+		receiver.topologyMu.Unlock()
+		t.Error("helper returned without holding the detached receiver's current root")
+	}
+	if !oldRoot.topologyMu.TryLock() {
+		t.Error("helper retained the stale old-root lock")
+	} else {
+		oldRoot.topologyMu.Unlock()
+	}
+	if witness.topologyMu.TryLock() {
+		witness.topologyMu.Unlock()
+		t.Error("helper lost the other requested root during retry")
+	}
+
+	releaseTask()
+	if err, ok := task.await(t, "moved receiver after release"); ok && err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeTopology_GraftRejectsOwnershipChangedAfterPrecheck(t *testing.T) {
+	target := graftTestTree(t, "lazy", "TARGET")
+	owner := graftTestTree(t, "lazy", "OWNER")
+	source := graftTestTree(t, "lazy", "SOURCE")
+
+	source.realizeMu.RLock()
+	releaseRead := sync.OnceFunc(source.realizeMu.RUnlock)
+	task := startTopologyTestTask(func() error { return target.Graft("/new/slot", source) })
+	defer func() {
+		releaseRead()
+		if !task.collected {
+			if err, ok := task.await(t, "late ownership cleanup"); ok && err != nil {
+				t.Error(err)
+			}
+		}
+	}()
+
+	// With our read lock held, a failed TryRLock witnesses Graft's pending
+	// writer, which is after the detached-source fast precheck. No ownership
+	// has changed yet, so only the later locked recheck can reject it.
+	if !awaitTopologyTestLock(t, "source realization writer pending", source.realizeMu.TryRLock, source.realizeMu.RUnlock) {
+		return
+	}
+
+	// UNIT isolation of the late ownership check: install only an ownership
+	// edge with both root domains and the parent node locked. A second public
+	// Graft cannot do this while our realization read lock is held. We do not
+	// claim otherwise or touch realization/cache fields under a read lock.
+	unlock := lockTopologyRoots(owner, source)
+	owner.mu.Lock()
+	owner.children["claimed"] = source
+	source.mount.Store(&treeMount{parent: owner, name: "claimed"})
+	owner.mu.Unlock()
+	unlock()
+	releaseRead()
+
+	err, ok := task.await(t, "Graft after source ownership changed")
+	if !ok {
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), "already attached") {
+		t.Fatalf("Graft did not reject late native ownership: %v", err)
+	}
+	if target.Has("/new") {
+		t.Error("rejected Graft published missing target parents")
+	}
+	link := source.mount.Load()
+	if link == nil || link.parent != owner || link.name != "claimed" || owner.pickChild("claimed") != source {
+		t.Error("rejected Graft changed the established source owner")
 	}
 }
 
