@@ -1,7 +1,7 @@
 # ivy
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)](https://go.dev)
 
 A hierarchical content-construction engine for Go: content starts from a root
 template and flows down a path-addressed tree, where every node applies a
