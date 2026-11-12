@@ -51,28 +51,27 @@ func (t *tree) Graft(path string, source Tree) error {
 		}
 	}
 
-	nativeSource, _ := source.(*tree)
-	if nativeSource != nil {
-		// Reject a structural cycle before taking the source realization lock,
-		// including a callback trying to graft its own currently realizing tree.
-		if cycleCheck(nativeSource, t) {
-			return fmt.Errorf("graft would create a cycle")
-		}
+	var (
+		targetTree    Tree
+		remainingPath string
+		err           error
+	)
 
-		// Reject ownership before the realization lock, so even a callback
-		// on an attached source can fail fast rather than lock itself again.
-		if nativeSource.mount.Load() != nil {
-			return fmt.Errorf("graft source is already attached; detach it before remounting")
-		}
+	switch source := source.(type) {
+	case *tree:
+		targetTree, remainingPath, err = t.graftTree(q, source)
+	default:
+		targetTree, remainingPath, err = t.graftOther(q, source)
 	}
 
-	foreign, rest, err := t.graftNative(q, source, nativeSource)
 	if err != nil {
 		return err
 	}
 
-	if foreign != nil {
-		return foreign.Graft(rest, source)
+	// Both source-specific helpers release their locks before returning a
+	// custom target. Never invoke another implementation under native locks.
+	if targetTree != nil {
+		return targetTree.Graft(remainingPath, source)
 	}
 
 	return nil
@@ -107,81 +106,133 @@ func cycleCheck(source, parent *tree) bool {
 	}
 }
 
-// graftNative holds topology stable while resolving native parents. At a
-// foreign boundary it returns the remaining local path and releases all locks
-// before the caller invokes the foreign implementation's public Graft method.
-func (t *tree) graftNative(q pathQuery, source Tree, nativeSource *tree) (Tree, string, error) {
-	if nativeSource != nil {
-		nativeSource.realizeMu.Lock()
-		defer nativeSource.realizeMu.Unlock()
+// graftTree handles a concrete native source: its realization lock, ownership,
+// inherited cache and mount link. Source has already passed the nil check.
+func (t *tree) graftTree(q pathQuery, source *tree) (Tree, string, error) {
+	// Fail before taking the source lock, including a processor attempting
+	// to graft its own tree or an already attached source back into the root.
+	if cycleCheck(source, t) {
+		return nil, "", fmt.Errorf("graft would create a cycle")
 	}
 
-	unlock := lockTopologyRoots(t, nativeSource)
+	if source.mount.Load() != nil {
+		return nil, "", fmt.Errorf("graft source is already attached; detach it before remounting")
+	}
+
+	source.realizeMu.Lock()
+	defer source.realizeMu.Unlock()
+
+	unlock := lockTopologyRoots(t, source)
 	defer unlock()
 
+	targetTree, remainingQuery, err := t.locateGraftTarget(q)
+	if err != nil {
+		return nil, "", err
+	}
+
+	parent, isNativeTarget := targetTree.(*tree)
+	if !isNativeTarget {
+		return targetTree, remainingQuery.localPath(), nil
+	}
+
+	// Recheck ownership with both topology roots locked: the source could
+	// have moved while this operation waited to acquire its locks.
+	if cycleCheck(source, parent) {
+		return nil, "", fmt.Errorf("graft would create a cycle")
+	}
+
+	if source.mount.Load() != nil {
+		return nil, "", fmt.Errorf("graft source is already attached; detach it before remounting")
+	}
+
+	name := remainingQuery.head()
+	if !validNativeName(parent, name) {
+		return nil, "", fmt.Errorf("graft name %q is incompatible with enclosing path syntax", name)
+	}
+
+	if err := validateNativeNames(source, nativeParsers(parent)); err != nil {
+		return nil, "", err
+	}
+
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+
+	if previousTree, ok := parent.children[name].(*tree); ok {
+		previousTree.mount.Store(nil)
+	}
+
+	// Only the source root needs invalidation: its next publication has a
+	// newer contentVer, which transitively invalidates all descendants.
+	// pendingBase keeps standard descendant Set from using the old template.
+	source.basePending.Store(true)
+	source.realizedAt = time.Time{}
+	source.realizedFrom = 0
+
+	source.contentMu.Lock()
+	source.base = nil
+	source.content = nil
+	source.contentVer++
+	source.contentMu.Unlock()
+
+	source.mount.Store(&treeMount{parent: parent, name: name})
+	parent.children[name] = source
+
+	return nil, "", nil
+}
+
+// graftOther attaches a custom source by reference. Its implementation owns
+// its internal state; native code only manages the destination child edge.
+func (t *tree) graftOther(q pathQuery, source Tree) (Tree, string, error) {
+	unlock := lockTopologyRoots(t)
+	defer unlock()
+
+	targetTree, remainingQuery, err := t.locateGraftTarget(q)
+	if err != nil {
+		return nil, "", err
+	}
+
+	parent, isNativeTarget := targetTree.(*tree)
+	if !isNativeTarget {
+		return targetTree, remainingQuery.localPath(), nil
+	}
+
+	name := remainingQuery.head()
+	if !validNativeName(parent, name) {
+		return nil, "", fmt.Errorf("graft name %q is incompatible with enclosing path syntax", name)
+	}
+
+	parent.mu.Lock()
+	defer parent.mu.Unlock()
+
+	if previousTree, ok := parent.children[name].(*tree); ok {
+		previousTree.mount.Store(nil)
+	}
+
+	parent.children[name] = source
+
+	return nil, "", nil
+}
+
+// locateGraftTarget finds the native parent of the final edge, or the custom
+// target that must handle the remaining local query. It does not process source
+// state. Callers must hold the receiver's enclosing-root topology lock.
+func (t *tree) locateGraftTarget(q pathQuery) (Tree, pathQuery, error) {
 	parent := t
 	for !q.next().done() {
 		child := parent.pickChild(q.head())
 		if child == nil {
-			return nil, "", fmt.Errorf("graft parent at %q: %w", q.localPath(), ErrNotExistsTree)
+			return nil, q, fmt.Errorf("graft parent at %q: %w", q.localPath(), ErrNotExistsTree)
 		}
 
 		q = q.next()
 		if nativeChild, ok := child.(*tree); ok {
 			parent = nativeChild
 		} else {
-			return child, q.localPath(), nil
+			return child, q, nil
 		}
 	}
 
-	if nativeSource != nil {
-		if cycleCheck(nativeSource, parent) {
-			return nil, "", fmt.Errorf("graft would create a cycle")
-		}
-
-		if nativeSource.mount.Load() != nil {
-			return nil, "", fmt.Errorf("graft source is already attached; detach it before remounting")
-		}
-	}
-
-	if !validNativeName(parent, q.head()) {
-		return nil, "", fmt.Errorf("graft name %q is incompatible with enclosing path syntax", q.head())
-	}
-
-	if nativeSource != nil {
-		if err := validateNativeNames(nativeSource, nativeParsers(parent)); err != nil {
-			return nil, "", err
-		}
-	}
-
-	parent.mu.Lock()
-	defer parent.mu.Unlock()
-
-	if previousTree, ok := parent.children[q.head()].(*tree); ok {
-		previousTree.mount.Store(nil)
-	}
-
-	if nativeSource != nil {
-		// Only the source root needs invalidation: its next publication has
-		// a newer contentVer, which transitively invalidates all descendants.
-		// pendingBase also prevents standard descendant Set from eagerly
-		// evaluating against the old source template before that first read.
-		nativeSource.basePending.Store(true)
-		nativeSource.realizedAt = time.Time{}
-		nativeSource.realizedFrom = 0
-
-		nativeSource.contentMu.Lock()
-		nativeSource.base = nil
-		nativeSource.content = nil
-		nativeSource.contentVer++
-		nativeSource.contentMu.Unlock()
-
-		nativeSource.mount.Store(&treeMount{parent: parent, name: q.head()})
-	}
-
-	parent.children[q.head()] = source
-
-	return nil, "", nil
+	return parent, q, nil
 }
 
 func nativeParsers(node *tree) []driver.PathParser {
