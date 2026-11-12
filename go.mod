@@ -10,7 +10,9 @@ require (
 	github.com/swaggo/swag v1.16.6
 	github.com/tidwall/gjson v1.14.2
 	github.com/tidwall/sjson v1.2.5
-	github.com/tr1v3r/pkg v0.2.1
+	github.com/tr1v3r/pkg/fetch v0.1.0
+	github.com/tr1v3r/pkg/guard v0.1.0
+	github.com/tr1v3r/pkg/log v0.1.0
 	github.com/tr1v3r/stream v0.1.0
 	golang.org/x/time v0.3.0
 	gopkg.in/yaml.v3 v3.0.1
