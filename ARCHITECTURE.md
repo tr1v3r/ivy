@@ -128,6 +128,41 @@ type ParamAware interface { ParamKeys() []string }
 - 静态前缀 `procs[:dynamicFrom]`：按 standard/lazy/instant/TTL 原语义 realize 并缓存；
 - 动态层 `procs[dynamicFrom:]`：仅在**目标节点**由 `dynamicRealize` 在每次 `GetWithContext` 时叠加请求上下文重算，结果只返回给调用者、**从不写回节点缓存**（`tree.go` 注释明确此契约）——不同参数永不互相污染。
 
+### 3.4 混合模式子树挂接（`GraftAt`）
+
+`GraftAt(dst Tree, path string, src Tree) error` 是不扩展 `Tree` 接口的安全组合入口：
+目标父节点必须存在，目标不能是根；复制源子树并整体替换目标，源树保持独立。
+原 `Tree.Graft` 仅插入引用，不重定位，不能替代此 API。
+
+```text
+【准备，不发布】
+GraftAt(dst, "/api/config", src)
+│ 查找 /api → 校验源为原生 ivy 节点、无环、名称可被目标路径语法表示
+│ 复制节点 / 模式 / 处理器链 → 重定位 path、level
+│ 丢弃源模板和缓存 → 基底来自目标父节点
+│ 保留源 Realizer / Modem，统一使用目标 PathParser
+│
+├─ 全部祖先为 standard → 提前计算 standard 静态前缀
+└─ 任一祖先为 lazy / instant / TTL → 延后至访问，不触发祖先求值
+
+【原子发布】
+父节点 children["config"] = 准备好的子树（持有结构写锁）
+│ 准备失败 → 旧子树不变；外部处理器副作用无法回滚
+└─ 并发读 → 完整旧子树或完整新子树；结构写入需外部串行化
+
+【查询与刷新】
+父节点 (content, version) → 子节点缓存校验
+├─ 父版本未变 → 按子节点自身模式复用 / 过期 / 每次重算
+└─ 父版本更新 → 所有模式均从新父内容重新组合，包括 standard 子节点
+   └─ nil 内容也是有效基底；不从上次处理结果重复叠加
+```
+
+节点结构、缓存和限流器独立；Driver、Processor 和默认上下文对象共享引用，
+使用期间不能并发修改其配置。挂接节点向处理器提供独立输入字节，避免原地修改
+破坏父节点或动态层污染静态缓存；默认上下文在静态求值时按值复制后设置新路径。
+`Set` 遇到尚未获得父内容的 standard 节点时也延后求值，避免提前计算错误基底。
+参数动态层仍只作用于查询目标，语义不变。格式兼容或转换由调用者负责。
+
 ## 4. 构建流程走透
 
 ### 路径 A：HTTP 服务（JSON 规则文件 → webDriver 树 → 查询）

@@ -71,7 +71,9 @@ type Tree interface {
 	// Del deletes a node at the given path.
 	Del(path string) error
 
-	// Graft attaches a sub-tree.
+	// Graft attaches a child reference by name without rebasing paths,
+	// levels or caches. It is a low-level operation for already positioned
+	// nodes; use GraftAt for independently constructed or mixed-mode trees.
 	Graft(Tree)
 
 	// ShowStruct returns the tree structure as JSON.

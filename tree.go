@@ -3,6 +3,7 @@ package ivy
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,6 +86,12 @@ type tree struct {
 	// OLDER version leaves it alone (older = stale carry, the cache is
 	// already based on newer parent content than the caller saw).
 	realizedFrom uint64
+	// basePending defers eager Set on a mounted standard node until its
+	// deferred ancestry first supplies a valid base. Atomic so creating a
+	// child never needs to acquire its parent's realization lock.
+	basePending atomic.Bool
+	// grafted nodes isolate processor inputs from shared parent/cache bytes.
+	grafted bool
 
 	rlMu        sync.RWMutex
 	rateLimiter *rate.Limiter
@@ -320,6 +327,10 @@ func (t *tree) dynamicRealize(rc *driver.RealizeContext) ([]byte, error) {
 	if len(dynamic) == 0 {
 		return content, nil // fully static chain: nothing to do per request
 	}
+	if t.grafted {
+		content = slices.Clone(content)
+		rc = t.graftContext(rc)
+	}
 	content, err := t.driver.Realize(rc, content, dynamic...)
 	if err != nil {
 		return nil, fmt.Errorf("realize dynamic rule on %s fail: %w", t.Path(), err)
@@ -330,6 +341,10 @@ func (t *tree) dynamicRealize(rc *driver.RealizeContext) ([]byte, error) {
 // doFallback calls the fallback processor if set, otherwise returns content unchanged.
 func (t *tree) doFallback(rc *driver.RealizeContext, content []byte) ([]byte, error) {
 	if fb := t.fallback.Load(); fb != nil {
+		if t.grafted {
+			content = slices.Clone(content)
+			rc = t.graftContext(rc)
+		}
 		return (*fb).Process(rc, content)
 	}
 	return content, nil
@@ -454,6 +469,7 @@ func (t *tree) newSubTree(name string) Tree {
 	// from (review finding on #80; near-zero impact since build is
 	// single-threaded and lazy children recompose on first access, but
 	// the pair read closes the window for free)
+	basePending := t.basePending.Load()
 	snapshot, parentVer := t.getWithVersion()
 
 	child := &tree{
@@ -475,10 +491,12 @@ func (t *tree) newSubTree(name string) Tree {
 		// descents can compare against it until the first own realization
 		// stores what it actually composed from (issue #48)
 		realizedFrom: parentVer,
+		grafted:      t.grafted,
 		children:     make(map[string]Tree),
 	}
 	// inherit the management fields through their atomic slots (issue #47:
 	// plain field copies raced SetFallback/SetDefaultContext)
+	child.basePending.Store(basePending)
 	child.defaultCtx.Store(t.defaultCtx.Load())
 	child.fallback.Store(t.fallback.Load())
 	return child
@@ -504,7 +522,7 @@ func (t *tree) apply(procs ...driver.Processor) error {
 	// chain (without this, the fast path in realizeWithParentCtx keeps
 	// serving the old content forever when cacheTTL == 0).
 	t.realizedAt = time.Time{}
-	if t.lazyMode {
+	if t.lazyMode || t.basePending.Load() {
 		return nil
 	}
 	// standard mode: realize only the static prefix at build time; the
@@ -512,7 +530,7 @@ func (t *tree) apply(procs ...driver.Processor) error {
 	// realized from the node's own base, which captures the parent
 	// publication the node was created from — keep realizedFrom pinned to
 	// that version so descents do not spuriously invalidate.
-	return t.realizeLocked(t.defaultCtx.Load(), nil, t.realizedFrom)
+	return t.realizeLocked(t.defaultCtx.Load(), t.getBase(), t.realizedFrom)
 }
 
 // dynamicSplit returns the index of the first param-aware processor.
@@ -602,12 +620,23 @@ func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte, pa
 
 	// Realize from the pre-processor base, never from the node's previous
 	// output: re-realization must be idempotent for non-idempotent chains.
-	// Lazy nodes compose from the parent's realized content carried down
-	// by getWithParent; the decision is made here, under the write lock,
-	// together with the realization it feeds.
+	// Every child, including a standard child below a deferred parent,
+	// composes from the carried parent publication. A nonzero version means
+	// a parent is present even when its content is nil. Retain the new base
+	// so a subsequent standard-mode Set cannot reuse a stale snapshot.
 	base := t.getBase()
-	if t.lazyMode && parentContent != nil {
+	if parentVer != 0 {
 		base = parentContent
+		t.contentMu.Lock()
+		t.base = base
+		t.contentMu.Unlock()
+	}
+	if t.grafted {
+		base = slices.Clone(base)
+		rc = t.graftContext(rc)
+		if rc != nil && parentVer != 0 {
+			rc.ParentContent = slices.Clone(parentContent)
+		}
 	}
 
 	rule, err := t.driver.Realize(rc, base, t.staticProcs()...)
@@ -618,6 +647,7 @@ func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte, pa
 	t.realizedFrom = parentVer
 
 	t.realizedAt = time.Now()
+	t.basePending.Store(false)
 	return nil
 }
 

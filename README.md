@@ -119,6 +119,58 @@ The `curl` processor owns its security posture explicitly:
 
 (Same variants exist for YAML, TOML, XML, and Tile drivers.)
 
+### Mixing modes within a tree
+
+Use `ivy.GraftAt(destination, path, source)` to insert or replace an entire
+subtree at any non-root path whose parent already exists. Pass the destination
+root tree (not an internal node) as `destination`:
+
+```go
+root, err := ivy.NewJSONTree[ivy.Directive]("cfg", `{"enabled":true}`)
+if err != nil {
+    return err
+}
+branch, err := ivy.NewLazyJSONTree("branch", `{}`,
+    ivy.NewDirective("/", &driver.JSONProcessor{
+        T: "create", JSONPath: "region", V: []byte("beijing"),
+    }),
+)
+if err != nil {
+    return err
+}
+if err := ivy.GraftAt(root, "/api", branch); err != nil {
+    return err
+}
+value, err := root.Get("/api") // {"enabled":true,"region":"beijing"}
+```
+
+- The copied root takes the target name; all descendants get new paths and
+  levels. Existing descendants at the target are replaced, not merged.
+- Each copied node retains its own standard/lazy/instant/TTL mode. Standard
+  nodes are computed at graft time only if every ancestor is standard; below
+  a deferred ancestor they wait for access. Parent refreshes invalidate child
+  caches even when a child is standard or has a longer TTL.
+- Source templates and cached results are **not** mounted: content flows from
+  the destination parent. The source tree remains unchanged and can be reused;
+  topology, caches and rate limiters are independent.
+- Drivers' realizers/modems, processor objects and default-context objects are
+  shared with the source; keep their configuration immutable during use. The
+  destination path syntax applies throughout the mounted branch. Matching
+  content formats (or providing an explicit conversion processor) is the
+  caller's responsibility.
+- Fallbacks, default contexts and rate-limit settings are copied from the
+  source. Parameter-aware processors remain per-query and never enter caches.
+- Both trees and all source descendants must be native ivy trees. Invalid
+  paths, missing parents, cycles and eager processor failures return errors
+  without replacing the old subtree; processor external side effects cannot
+  be undone. Deferred processor errors surface on access.
+- Concurrent queries see either the old subtree or its complete replacement.
+  Serialize structural writers (`GraftAt`, raw `Graft`, `Del`, and `Set` that
+  creates nodes); copying a source is not a transaction across source edits.
+
+The existing `Tree.Graft` is only a low-level reference insertion: it does not
+rebase independently constructed trees. Prefer `GraftAt` for composition.
+
 ## Development
 
 ```bash
