@@ -107,7 +107,7 @@ func TestNativeTopology_UnrelatedTreesDoNotBlock(t *testing.T) {
 }
 
 // Segment parsing remains promoted from testPathDriver, so GetLevel is first
-// called by validNativeName inside Set's locked structural insertion path.
+// called by validNativeName inside Graft's locked topology validation.
 type topologyBlockingDriver struct {
 	*testPathDriver
 	enabled atomic.Bool
@@ -139,9 +139,10 @@ func TestNativeTopology_ActualMutationDoesNotBlockUnrelatedTree(t *testing.T) {
 
 	b := graftTestTree(t, "lazy", "B", NewDirective("/old"))
 	other := graftTestTree(t, "lazy", "OTHER")
+	source := graftTestTree(t, "lazy", "SOURCE")
 	blockingDriver.enabled.Store(true)
 	unblockA := sync.OnceFunc(func() { close(blockingDriver.release) })
-	aTask := startTopologyTestTask(func() error { return a.Set(NewDirective("/new")) })
+	aTask := startTopologyTestTask(func() error { return a.Graft("/new", source) })
 	var bTask *topologyTestTask
 	defer func() {
 		unblockA()
@@ -161,7 +162,7 @@ func TestNativeTopology_ActualMutationDoesNotBlockUnrelatedTree(t *testing.T) {
 	select {
 	case <-blockingDriver.entered:
 	case <-timer.C:
-		t.Fatal("A.Set did not enter structural name validation")
+		t.Fatal("A.Graft did not enter structural name validation")
 	}
 
 	// A is suspended inside a real mutation, after acquiring its actual
@@ -192,12 +193,12 @@ func TestNativeTopology_ActualMutationDoesNotBlockUnrelatedTree(t *testing.T) {
 	select {
 	case err := <-aTask.done:
 		aTask.collected = true
-		t.Fatalf("A.Set completed before its validation barrier was released: %v", err)
+		t.Fatalf("A.Graft completed before its validation barrier was released: %v", err)
 	default:
 	}
 
 	unblockA()
-	if err, ok := aTask.await(t, "A.Set after releasing validation barrier"); ok && err != nil {
+	if err, ok := aTask.await(t, "A.Graft after releasing validation barrier"); ok && err != nil {
 		t.Fatal(err)
 	}
 }

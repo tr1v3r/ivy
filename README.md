@@ -180,9 +180,11 @@ Native mounting has these semantics:
 - Every source node keeps its own driver, processors, evaluation mode, rate
   limiter and context objects. These are the same objects, not copies.
   Matching content formats (or an explicit conversion processor) is the
-  caller's responsibility. Native node aliases must also be representable in
-  every enclosing native path grammar; incompatible names are rejected rather
-  than creating nodes that root or retained-handle queries cannot address.
+  caller's responsibility. At mount time, `Graft` validates native source names
+  and the target alias against enclosing native path grammars. Native `Set`
+  follows its entry parser, including interior empty segments, without this
+  extra name validation. Callers maintaining views with different parsers must
+  keep later edits compatible with the views they use.
 - Mounting invalidates cached results, retaining the last base until access
   replaces it with the destination parent's content (even when that is nil).
   Detaching before that access preserves the previous base.

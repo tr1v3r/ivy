@@ -404,6 +404,11 @@ func TestGraft_PreservesDefaultContextFallbackAndLimiter(t *testing.T) {
 	src := graftTestTree(t, "lazy", "SOURCE", NewDirective("/", &driver.RawProcessor{
 		Proc: func(rc *driver.RealizeContext, before []byte) ([]byte, error) {
 			paths = append(paths, rc.TreePath)
+			if string(rc.ParentContent) != "D" {
+				t.Fatalf("processor parent content = %q; want D", rc.ParentContent)
+			}
+
+			rc.ParentContent[0] = 'X'
 			value, _ := rc.Value(contextKey{}).(string)
 
 			return appendProc("-"+value).Process(rc, before)
@@ -425,6 +430,7 @@ func TestGraft_PreservesDefaultContextFallbackAndLimiter(t *testing.T) {
 	}
 
 	graftTestGet(t, dst, "/alias", "D-source-context")
+	graftTestGet(t, dst, "/", "D")
 	graftTestGet(t, dst, "/alias/missing", "D-source-context-fallback")
 	if len(paths) != 1 || paths[0] != "/alias" {
 		t.Fatalf("default-context TreePath = %v", paths)
@@ -576,6 +582,34 @@ func TestGraft_SingleParentOwnershipAndCycles(t *testing.T) {
 
 	if a.pickChild("mount") != src || b.Has("/other") || a.Has("/other") {
 		t.Fatal("failed ownership check changed topology")
+	}
+}
+
+func TestSet_PreservesParsedPathSegments(t *testing.T) {
+	for _, mode := range []string{"standard", "lazy", "instant", "ttl"} {
+		for _, path := range []string{"/a//b", "/a/ /b", "/a/name /b"} {
+			t.Run(mode+path, func(t *testing.T) {
+				root := graftTestTree(t, mode, "ROOT", NewDirective(path, appendProc("-old")))
+				graftTestGet(t, root, path, "ROOT-old")
+
+				if err := root.Set(NewDirective(path, appendProc("-new"))); err != nil {
+					t.Fatal(err)
+				}
+
+				if !root.Has(path) || root.Has("/a/b") {
+					t.Fatal("Set discarded or normalized an interior path segment")
+				}
+
+				graftTestGet(t, root, path, "ROOT-new")
+				if err := root.Del(path); err != nil {
+					t.Fatal(err)
+				}
+
+				if root.Has(path) {
+					t.Fatal("Del did not preserve the parsed path segments")
+				}
+			})
+		}
 	}
 }
 

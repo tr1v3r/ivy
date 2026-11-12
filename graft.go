@@ -272,7 +272,7 @@ func validNativeName(node *tree, name string) bool {
 // must be addressable through every enclosing native receiver's path grammar;
 // opaque foreign trees own their own path interpretation at the boundary.
 func validateNativeNames(node *tree, parsers []driver.PathParser) error {
-	parsers = append(slices.Clone(parsers), node.driver)
+	parsers = append(parsers, node.driver)
 
 	node.mu.RLock()
 	defer node.mu.RUnlock()

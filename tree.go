@@ -174,11 +174,7 @@ func (t *tree) setQuery(q pathQuery, procs []driver.Processor) error {
 		return t.apply(procs...)
 	}
 
-	child, err := t.getChild(q.head())
-	if err != nil {
-		return err
-	}
-
+	child := t.getChild(q.head())
 	rest := q.next()
 	if nativeChild, ok := child.(*tree); ok {
 		return nativeChild.setQuery(rest, procs)
@@ -597,9 +593,9 @@ func (t *tree) deleteNode(name string) error {
 
 // getChild get a child tree.
 // if not found, create a new sub tree and return it
-func (t *tree) getChild(name string) (Tree, error) {
+func (t *tree) getChild(name string) Tree {
 	if child := t.pickChild(name); child != nil {
-		return child, nil
+		return child
 	}
 
 	// Recheck while inserting so concurrent Set calls cannot replace each
@@ -611,18 +607,12 @@ func (t *tree) getChild(name string) (Tree, error) {
 	defer t.mu.Unlock()
 
 	if child := t.children[name]; child != nil {
-		return child, nil
-	}
-
-	// Validate under the same topology lock as insertion: the receiver may
-	// have moved beneath a different path grammar while Set was resolving.
-	if !validNativeName(t, name) {
-		return nil, fmt.Errorf("node name %q is incompatible with enclosing path syntax", name)
+		return child
 	}
 
 	child := t.newSubTree(name)
 	t.children[name] = child
-	return child, nil
+	return child
 }
 
 func (t *tree) getChildren() (children []Tree) {
@@ -645,8 +635,7 @@ func (t *tree) pickChild(name string) Tree {
 	return t.children[name]
 }
 
-// newSubTree create a new sub tree.
-// name cannot be empty
+// newSubTree creates a child with inherited configuration.
 func (t *tree) newSubTree(name string) Tree {
 	// one pair read pins (content, version) together: three separate
 	// locked reads could observe a parent set() in between and hand the
@@ -835,10 +824,12 @@ func (t *tree) realizeLocked(rc *driver.RealizeContext, parentContent []byte, pa
 	}
 
 	base = slices.Clone(base)
-	rc = t.processorContext(rc)
 	if rc != nil && parentVer != 0 {
-		rc.ParentContent = slices.Clone(parentContent)
+		local := *rc
+		local.ParentContent = parentContent
+		rc = &local
 	}
+	rc = t.processorContext(rc)
 
 	rule, err := t.driver.Realize(rc, base, t.staticProcs()...)
 	if err != nil {

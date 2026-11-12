@@ -454,7 +454,7 @@ func TestGraft_CustomTargetCanForwardAfterLocksReleased(t *testing.T) {
 	}
 }
 
-func TestGraft_RejectsAmbiguousNativeNames(t *testing.T) {
+func TestGraft_NameValidationIsMountOnly(t *testing.T) {
 	dotDriver := &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")}
 	bad, err := NewLazyTree(dotDriver, "source", "SOURCE", NewDirective(".a/b"))
 	if err != nil {
@@ -490,10 +490,6 @@ func TestGraft_RejectsAmbiguousNativeNames(t *testing.T) {
 		{good, ".a/b"},       // unrepresentable through outer slash root
 		{root, "/mount/a.b"}, // unrepresentable through retained dot source
 	} {
-		if err := tc.receiver.Set(NewDirective(tc.path)); err == nil {
-			t.Errorf("Set accepted an ambiguous name at %q", tc.path)
-		}
-
 		other := graftTestTree(t, "lazy", "OTHER")
 		if err := tc.receiver.Graft(tc.path, other); err == nil {
 			t.Errorf("Graft accepted an ambiguous name at %q", tc.path)
@@ -502,5 +498,15 @@ func TestGraft_RejectsAmbiguousNativeNames(t *testing.T) {
 		if other.Path() != "" {
 			t.Fatal("rejected source gained an owner")
 		}
+
+		if err := tc.receiver.Set(NewDirective(tc.path, appendProc("-new"))); err != nil {
+			t.Fatalf("Set rejected a path accepted by its entry parser: %v", err)
+		}
+
+		if !tc.receiver.Has(tc.path) {
+			t.Fatal("Set did not preserve the entry parser's path")
+		}
+
+		graftTestGet(t, tc.receiver, tc.path, "D-new")
 	}
 }

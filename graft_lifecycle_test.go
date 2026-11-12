@@ -435,7 +435,7 @@ func TestGraft_StaleCarryCannotPublishAfterRemount(t *testing.T) {
 	}
 }
 
-func TestGraft_ConcurrentSetAndTransferKeepNamesAddressable(t *testing.T) {
+func TestGraft_ConcurrentSetAndTransferPreserveUpdates(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		root := graftTestTree(t, "standard", "D")
 		dotDriver := &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")}
@@ -448,7 +448,7 @@ func TestGraft_ConcurrentSetAndTransferKeepNamesAddressable(t *testing.T) {
 		setDone, graftDone := make(chan error, 1), make(chan error, 1)
 		go func() {
 			<-start
-			setDone <- source.Set(NewDirective(".a/b"))
+			setDone <- source.Set(NewDirective(".leaf", appendProc("-leaf")))
 		}()
 
 		go func() {
@@ -458,8 +458,14 @@ func TestGraft_ConcurrentSetAndTransferKeepNamesAddressable(t *testing.T) {
 
 		close(start)
 		setErr, graftErr := <-setDone, <-graftDone
-		if setErr == nil && graftErr == nil {
-			t.Fatal("Set raced with ownership transfer to create an unreachable alias")
+		if setErr != nil || graftErr != nil {
+			t.Fatalf("concurrent Set/Graft errors = %v/%v", setErr, graftErr)
 		}
+
+		if root.pickChild("slot") != source || !source.Has(".leaf") {
+			t.Fatal("ownership transfer lost the source identity or concurrent update")
+		}
+
+		graftTestGet(t, root, "/slot/leaf", "D-leaf")
 	}
 }
