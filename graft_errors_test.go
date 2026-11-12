@@ -46,7 +46,7 @@ func TestGraft_InvalidStructureIsNotMissingTree(t *testing.T) {
 	root := graftTestTree(t, "lazy", "ROOT", NewDirective("/child"))
 	source := graftTestTree(t, "lazy", "SOURCE")
 
-	for _, path := range []string{"/", "/bad//name"} {
+	for _, path := range []string{"", "/"} {
 		err := root.Graft(path, source)
 
 		if err == nil || errors.Is(err, ErrNotExistsTree) {
@@ -58,6 +58,51 @@ func TestGraft_InvalidStructureIsNotMissingTree(t *testing.T) {
 
 	if err == nil || errors.Is(err, ErrNotExistsTree) {
 		t.Fatalf("cycle error = %v; want a structural validation error", err)
+	}
+}
+
+func TestGraft_EmptySegmentUsesParentLookup(t *testing.T) {
+	for _, sourceKind := range []string{"native", "custom"} {
+		t.Run(sourceKind, func(t *testing.T) {
+			root := graftTestTree(t, "standard", "ROOT", NewDirective("/a/b", appendProc("-keep")))
+			source := graftDispatchSource(t, sourceKind == "native")
+			parent := root.pickChild("a").(*tree)
+			previous := parent.pickChild("b")
+
+			err := root.Graft("/a//b", source)
+
+			if !errors.Is(err, ErrNotExistsTree) {
+				t.Fatalf("Graft error = %v; want missing empty-named parent", err)
+			}
+
+			if parent.pickChild("") != nil || parent.pickChild("b") != previous {
+				t.Fatal("failed lookup created an empty parent or skipped it to replace /a/b")
+			}
+
+			graftTestGet(t, root, "/a/b", "ROOT-keep")
+		})
+	}
+}
+
+func TestGraft_EmptySegmentsReachCustomTarget(t *testing.T) {
+	for _, sourceKind := range []string{"native", "custom"} {
+		t.Run(sourceKind, func(t *testing.T) {
+			root := graftTestTree(t, "standard", "ROOT", NewDirective("/parent"))
+			target := newGraftTestForeignTree()
+			source := graftDispatchSource(t, sourceKind == "native")
+
+			if err := root.Graft("/parent/target", target); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := root.Graft("/parent/target/a//b", source); err != nil {
+				t.Fatal(err)
+			}
+
+			if target.calls["Graft"] != "/a//b" || target.graftSource != source {
+				t.Fatalf("custom target received path %q and source %p; want /a//b and %p", target.calls["Graft"], target.graftSource, source)
+			}
+		})
 	}
 }
 

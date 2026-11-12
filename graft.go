@@ -45,12 +45,6 @@ func (t *tree) Graft(path string, source Tree) error {
 		return fmt.Errorf("graft cannot replace the receiver root")
 	}
 
-	for i := 1; i <= q.level(); i++ {
-		if q.name(i) == "" {
-			return fmt.Errorf("graft path %q contains an empty segment", path)
-		}
-	}
-
 	var (
 		targetTree    Tree
 		remainingPath string

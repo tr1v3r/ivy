@@ -490,7 +490,7 @@ func TestGraft_DefaultContextTracksRemountWithoutMutation(t *testing.T) {
 }
 
 func TestGraft_RejectsInvalidPathsAndSources(t *testing.T) {
-	for _, kind := range []string{"root", "empty", "empty_segment", "missing_parent", "nil", "typed_nil", "self"} {
+	for _, kind := range []string{"root", "empty", "missing_parent_with_empty_segment", "missing_parent", "nil", "typed_nil", "self"} {
 		t.Run(kind, func(t *testing.T) {
 			dst := graftTestTree(t, "standard", "D", NewDirective("/keep", appendProc("-old")))
 			var source Tree = graftTestTree(t, "lazy", "SOURCE")
@@ -501,7 +501,7 @@ func TestGraft_RejectsInvalidPathsAndSources(t *testing.T) {
 				path = "/"
 			case "empty":
 				path = ""
-			case "empty_segment":
+			case "missing_parent_with_empty_segment":
 				path = "/a//b"
 			case "missing_parent":
 				path = "/missing/child"
