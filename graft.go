@@ -59,9 +59,9 @@ func (t *tree) Graft(path string, source Tree) error {
 
 	switch source := source.(type) {
 	case *tree:
-		targetTree, remainingPath, err = t.graftTree(q, source)
+		targetTree, remainingPath, err = t.graftNativeTree(q, source)
 	default:
-		targetTree, remainingPath, err = t.graftOther(q, source)
+		targetTree, remainingPath, err = t.graftTree(q, source)
 	}
 
 	if err != nil {
@@ -106,9 +106,9 @@ func cycleCheck(source, parent *tree) bool {
 	}
 }
 
-// graftTree handles a concrete native source: its realization lock, ownership,
+// graftNativeTree handles a concrete native source: its realization lock, ownership,
 // inherited cache and mount link. Source has already passed the nil check.
-func (t *tree) graftTree(q pathQuery, source *tree) (Tree, string, error) {
+func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) {
 	// Fail before taking the source lock, including a processor attempting
 	// to graft its own tree or an already attached source back into the root.
 	if cycleCheck(source, t) {
@@ -180,9 +180,9 @@ func (t *tree) graftTree(q pathQuery, source *tree) (Tree, string, error) {
 	return nil, "", nil
 }
 
-// graftOther attaches a custom source by reference. Its implementation owns
+// graftTree attaches a custom source by reference. Its implementation owns
 // its internal state; native code only manages the destination child edge.
-func (t *tree) graftOther(q pathQuery, source Tree) (Tree, string, error) {
+func (t *tree) graftTree(q pathQuery, source Tree) (Tree, string, error) {
 	unlock := lockTopologyRoots(t)
 	defer unlock()
 

@@ -140,8 +140,8 @@ type ParamAware interface { ParamKeys() []string }
 `source.Name()` 可以与别名 `config` 不同，原生 `source.Path()` 根据新父链返回
 `/api/config`。继续执行 `root.Graft("/api/config/live", other)` 会进入已经挂载的树。
 
-入口只按源类型分派一次：`graftTree` 接收非空 `*tree`，集中处理原生源的锁、归属和
-缓存；`graftOther` 接收其他 `Tree`，只修改目标连接，不操作源的内部状态。两条流程
+入口只按源类型分派一次：`graftNativeTree` 接收非空 `*tree`，集中处理原生源的锁、归属和
+缓存；`graftTree` 接收其他 `Tree`，只修改目标连接，不操作源的内部状态。两条流程
 复用 `locateGraftTarget` 查找目标。遇到自定义目标时，统一在 helper 释放锁之后由入口
 调用 `targetTree.Graft(remainingPath, source)`，不把可空的原生源参数贯穿各个步骤。
 
