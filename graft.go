@@ -114,7 +114,6 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 	if source.mount.Load() != nil {
 		return nil, "", fmt.Errorf("graft source is already attached; detach it before remounting")
 	}
-
 	if cycleCheck(source, t) {
 		return nil, "", fmt.Errorf("graft would create a cycle")
 	}
@@ -140,7 +139,6 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 	if source.mount.Load() != nil {
 		return nil, "", fmt.Errorf("graft source is already attached; detach it before remounting")
 	}
-
 	if cycleCheck(source, parent) {
 		return nil, "", fmt.Errorf("graft would create a cycle")
 	}
@@ -149,7 +147,6 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 	if !validNativeName(parent, name) {
 		return nil, "", fmt.Errorf("graft name %q is incompatible with enclosing path syntax", name)
 	}
-
 	if err := validateNativeNames(source, nativeParsers(parent)); err != nil {
 		return nil, "", err
 	}
