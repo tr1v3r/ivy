@@ -199,8 +199,12 @@ tracking applies to arbitrary custom implementations. Public source references
 remain aliases to the attached object, so coordinate edits according to that
 implementation's contract. Native retained-handle reads resolve ancestor static
 content too, including on the first read after mounting or an ancestor refresh.
-Native realization is not reentrant: do not transfer a detached source from
-inside a processor currently realizing that same source.
+Native reads check mount identity as well as parent content versions and retry
+from their entry root when ownership changes during a query. This prevents an
+old parent's snapshot from populating a remounted subtree's cache; processors
+may run again during a retried query. Native realization is not reentrant: do
+not transfer a detached source from inside a processor currently realizing
+that same source.
 
 `Forest.Refresh` / `RefreshTree` rebuild trees through their `TreeBuilder`;
 put the mounting steps in the builder to recreate the same composition on

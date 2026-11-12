@@ -2,6 +2,7 @@ package ivy
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/tr1v3r/ivy/driver"
@@ -101,5 +102,68 @@ func TestGraft_AttachedCallbackRejectsDuplicateOwnership(t *testing.T) {
 	graftTestGet(t, root, "/alias", "D")
 	if graftErr == nil || root.Has("/another") {
 		t.Fatal("callback could attach an already owned source")
+	}
+}
+
+func TestGraft_StaleCarryCannotPublishAfterRemount(t *testing.T) {
+	for _, contextual := range []bool{false, true} {
+		t.Run(map[bool]string{false: "Get", true: "GetWithContext"}[contextual], func(t *testing.T) {
+			a := graftTestTree(t, "standard", "A")
+			for i := 0; i < 10; i++ {
+				if err := a.Set(NewDirective("/", appendProc("-old"))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source := graftTestTree(t, "lazy", "SOURCE",
+				NewDirective("/", appendProc("-s")), NewDirective("/leaf", appendProc("-l")))
+			if err := a.Graft("/slot", source); err != nil {
+				t.Fatal(err)
+			}
+			// Model a query paused after selecting the old child and snapshot.
+			oldBinding := source.mount.Load()
+			oldContent, oldVersion := a.getWithVersion()
+			if err := a.Del("/slot"); err != nil {
+				t.Fatal(err)
+			}
+			b := graftTestTree(t, "standard", "B")
+			if err := b.Graft("/slot", source); err != nil {
+				t.Fatal(err)
+			}
+			q := newPathQuery(source.driver, "/leaf")
+			var err error
+			if contextual {
+				_, err = source.getContextWithParent(&driver.RealizeContext{Context: context.Background()}, oldContent, oldVersion, q, oldBinding)
+			} else {
+				_, err = source.getWithParent(oldContent, oldVersion, q, oldBinding)
+			}
+			if !errors.Is(err, errMountChanged) {
+				t.Fatalf("stale mount carry error = %v", err)
+			}
+			graftTestGet(t, b, "/slot/leaf", "B-s-l")
+			graftTestGet(t, b, "/slot/leaf", "B-s-l")
+			if source.realizedFrom >= oldVersion {
+				t.Fatal("old parent's higher version poisoned the new inherited cache")
+			}
+		})
+	}
+}
+
+func TestGraft_ConcurrentSetAndTransferKeepNamesAddressable(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		root := graftTestTree(t, "standard", "D")
+		dotDriver := &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")}
+		source, err := NewLazyTree[Directive](dotDriver, "source", "SOURCE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		setDone, graftDone := make(chan error, 1), make(chan error, 1)
+		go func() { <-start; setDone <- source.Set(NewDirective(".a/b")) }()
+		go func() { <-start; graftDone <- root.Graft("/slot", source) }()
+		close(start)
+		setErr, graftErr := <-setDone, <-graftDone
+		if setErr == nil && graftErr == nil {
+			t.Fatal("Set raced with ownership transfer to create an unreachable alias")
+		}
 	}
 }

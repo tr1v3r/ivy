@@ -1,6 +1,7 @@
 package ivy
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -14,6 +15,17 @@ import (
 // implementation detail, not a lock policy imposed on other Tree implementations.
 // No user processor or foreign Tree method is called while it is held.
 var nativeTopologyMu sync.Mutex
+
+var errMountChanged = errors.New("tree moved during query; retry from the root")
+
+// A native edge must still belong to the parent whose content the query carries.
+func queryMount(child, parent *tree, name string) (*treeMount, error) {
+	link := child.mount.Load()
+	if link == nil || link.parent != parent || link.name != name {
+		return nil, errMountChanged
+	}
+	return link, nil
+}
 
 type treeMount struct {
 	parent *tree
