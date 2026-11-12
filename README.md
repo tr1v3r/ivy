@@ -195,7 +195,12 @@ Native mounting has these semantics:
 
 The `Tree` interface does not prescribe a locking policy. Each implementation
 owns its concurrency guarantees; do not assume native inheritance or position
-tracking applies to arbitrary custom implementations. Public source references
+tracking applies to arbitrary custom implementations. Native structural edits
+lock only the involved enclosing roots: independent trees do not share a
+package-wide mutex. Cross-tree grafts acquire source/target root locks in a
+consistent order and recheck ownership after acquisition; detached subtrees
+activate their own instance lock without rewriting descendants.
+Public source references
 remain aliases to the attached object, so coordinate edits according to that
 implementation's contract. Native retained-handle reads resolve ancestor static
 content too, including on the first read after mounting or an ancestor refresh.

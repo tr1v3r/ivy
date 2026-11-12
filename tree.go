@@ -22,6 +22,9 @@ type tree struct {
 	// A single parent link determines the effective path. Moving a subtree
 	// updates only its root link, never every descendant's path or level.
 	mount atomic.Pointer[treeMount]
+	// Structural edits use the current enclosing root's mutex. Every node
+	// has its own dormant mutex ready if it later becomes a detached root.
+	topologyMu sync.Mutex
 
 	mu       sync.RWMutex
 	children map[string]Tree
@@ -533,8 +536,8 @@ func (t *tree) ShowStruct() []byte {
 
 // deleteNode delete a node from tree.
 func (t *tree) deleteNode(name string) error {
-	nativeTopologyMu.Lock()
-	defer nativeTopologyMu.Unlock()
+	unlock := lockNativeTopology(t)
+	defer unlock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if old, ok := t.children[name].(*tree); ok {
@@ -552,8 +555,8 @@ func (t *tree) getChild(name string) (Tree, error) {
 	}
 	// Recheck while inserting so concurrent Set calls cannot replace each
 	// other's newly created intermediate nodes. No processor runs here.
-	nativeTopologyMu.Lock()
-	defer nativeTopologyMu.Unlock()
+	unlock := lockNativeTopology(t)
+	defer unlock()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if child := t.children[name]; child != nil {

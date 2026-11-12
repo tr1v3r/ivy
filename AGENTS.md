@@ -191,5 +191,5 @@ Directives are defined in JSON format:
 
 - Modify `tree.go` for new tree operations
 - Update `export.go` interfaces if API changes are needed
-- Keep concurrency guarantees in the concrete implementation; the `Tree` interface must not prescribe locks. Native changes still need tests for their own topology/caching safety.
+- Keep concurrency guarantees in the concrete implementation; the `Tree` interface must not prescribe locks. Native topology locks belong to instances, never a package-wide singleton: resolve current enclosing roots, lock involved roots in a consistent order, and recheck ownership after acquisition. Native changes need topology/caching safety and independent-tree progress tests.
 - Preserve receiver-local path traversal, suffix delegation at custom-tree boundaries, direct source identity and detach/remount ownership; do not restore absolute-level routing.

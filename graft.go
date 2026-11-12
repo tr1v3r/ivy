@@ -5,16 +5,10 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/tr1v3r/ivy/driver"
 )
-
-// nativeTopologyMu protects native parent-link changes and insertions. It is an
-// implementation detail, not a lock policy imposed on other Tree implementations.
-// No user processor or foreign Tree method is called while it is held.
-var nativeTopologyMu sync.Mutex
 
 var errMountChanged = errors.New("tree moved during query; retry from the root")
 
@@ -107,8 +101,8 @@ func (t *tree) graftNative(q pathQuery, source Tree, native *tree) (Tree, string
 		native.realizeMu.Lock()
 		defer native.realizeMu.Unlock()
 	}
-	nativeTopologyMu.Lock()
-	defer nativeTopologyMu.Unlock()
+	unlock := lockNativeTopology(t, native)
+	defer unlock()
 	parent := t
 	for !q.next().done() {
 		child := parent.pickChild(q.head())
