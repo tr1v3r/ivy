@@ -2,6 +2,7 @@ package ivy
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +58,32 @@ func TestGraft_InvalidStructureIsNotMissingTree(t *testing.T) {
 
 	if err == nil || errors.Is(err, ErrNotExistsTree) {
 		t.Fatalf("cycle error = %v; want a structural validation error", err)
+	}
+}
+
+func TestGraft_OwnershipCheckPrecedesCycleCheck(t *testing.T) {
+	root := graftTestTree(t, "lazy", "ROOT", NewDirective("/branch/leaf"))
+	branch := root.pickChild("branch").(*tree)
+	leaf := branch.pickChild("leaf").(*tree)
+
+	for _, tc := range []struct {
+		name     string
+		receiver *tree
+		source   *tree
+		want     string
+	}{
+		{"attached_self", branch, branch, "already attached"},
+		{"attached_ancestor", leaf, branch, "already attached"},
+		{"detached_self", root, root, "cycle"},
+		{"detached_ancestor", leaf, root, "cycle"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.receiver.Graft("/slot", tc.source)
+
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Graft error = %v; want %q rejection", err, tc.want)
+			}
+		})
 	}
 }
 

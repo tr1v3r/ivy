@@ -111,12 +111,12 @@ func cycleCheck(source, parent *tree) bool {
 func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) {
 	// Fail before taking the source lock, including a processor attempting
 	// to graft its own tree or an already attached source back into the root.
-	if cycleCheck(source, t) {
-		return nil, "", fmt.Errorf("graft would create a cycle")
-	}
-
 	if source.mount.Load() != nil {
 		return nil, "", fmt.Errorf("graft source is already attached; detach it before remounting")
+	}
+
+	if cycleCheck(source, t) {
+		return nil, "", fmt.Errorf("graft would create a cycle")
 	}
 
 	source.realizeMu.Lock()
@@ -137,12 +137,12 @@ func (t *tree) graftNativeTree(q pathQuery, source *tree) (Tree, string, error) 
 
 	// Recheck ownership with both topology roots locked: the source could
 	// have moved while this operation waited to acquire its locks.
-	if cycleCheck(source, parent) {
-		return nil, "", fmt.Errorf("graft would create a cycle")
-	}
-
 	if source.mount.Load() != nil {
 		return nil, "", fmt.Errorf("graft source is already attached; detach it before remounting")
+	}
+
+	if cycleCheck(source, parent) {
+		return nil, "", fmt.Errorf("graft would create a cycle")
 	}
 
 	name := remainingQuery.head()
