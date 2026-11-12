@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -490,34 +491,49 @@ func TestGraft_DefaultContextTracksRemountWithoutMutation(t *testing.T) {
 }
 
 func TestGraft_RejectsInvalidPathsAndSources(t *testing.T) {
-	for _, kind := range []string{"root", "empty", "missing_parent_with_empty_segment", "missing_parent", "nil", "typed_nil", "self"} {
-		t.Run(kind, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		missing    bool
+	}{
+		{"root", "/", false},
+		{"empty", "", false},
+		{"missing_parent", "/missing/child", true},
+		{"nil_source", "/keep", true},
+		{"typed_nil_native", "/keep", true},
+		{"typed_nil_custom", "/keep", true},
+		{"nil_receiver", "/keep", true},
+		{"self", "/keep", false},
+		{"ancestor_cycle", "/keep/cycle", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			dst := graftTestTree(t, "standard", "D", NewDirective("/keep", appendProc("-old")))
 			var source Tree = graftTestTree(t, "lazy", "SOURCE")
-			path := "/keep"
+			receiver := dst
 
-			switch kind {
-			case "root":
-				path = "/"
-			case "empty":
-				path = ""
-			case "missing_parent_with_empty_segment":
-				path = "/a//b"
-			case "missing_parent":
-				path = "/missing/child"
-			case "nil":
+			switch tc.name {
+			case "nil_source":
 				source = nil
-			case "typed_nil":
+			case "typed_nil_native":
 				var native *tree
 				source = native
-			case "self":
+			case "typed_nil_custom":
+				var custom *graftTestForeignTree
+				source = custom
+			case "nil_receiver":
+				receiver = nil
+			case "self", "ancestor_cycle":
 				source = dst
 			}
 
 			old := dst.pickChild("keep")
+			err := receiver.Graft(tc.path, source)
 
-			if err := dst.Graft(path, source); err == nil {
-				t.Fatal("expected invalid graft error")
+			if err == nil || errors.Is(err, ErrNotExistsTree) != tc.missing {
+				t.Fatalf("Graft error = %v; want rejection, missing=%v", err, tc.missing)
+			}
+
+			if tc.missing && receiver != nil && errors.Unwrap(err) == nil {
+				t.Fatal("Graft discarded source/parent context instead of wrapping the sentinel")
 			}
 
 			if dst.pickChild("keep") != old {
@@ -563,223 +579,77 @@ func TestGraft_SingleParentOwnershipAndCycles(t *testing.T) {
 	}
 }
 
-type graftTestSourceDriver struct {
-	*testPathDriver
-	calls *atomic.Int32
-}
+func TestGraft_EmptySegmentUsesParentLookup(t *testing.T) {
+	for _, sourceKind := range []string{"native", "custom"} {
+		t.Run(sourceKind, func(t *testing.T) {
+			root := graftTestTree(t, "standard", "ROOT", NewDirective("/a/b", appendProc("-keep")))
+			source := graftDispatchSource(t, sourceKind == "native")
+			parent := root.pickChild("a").(*tree)
+			previous := parent.pickChild("b")
 
-func (*graftTestSourceDriver) Name() string { return "graft-source" }
+			err := root.Graft("/a//b", source)
 
-func (d *graftTestSourceDriver) Realize(rc *driver.RealizeContext, before []byte, procs ...driver.Processor) ([]byte, error) {
-	d.calls.Add(1)
+			if !errors.Is(err, ErrNotExistsTree) {
+				t.Fatalf("Graft error = %v; want missing empty-named parent", err)
+			}
 
-	return d.StdRealizer.Realize(rc, before, procs...)
-}
+			if parent.pickChild("") != nil || parent.pickChild("b") != previous {
+				t.Fatal("failed lookup created an empty parent or skipped it to replace /a/b")
+			}
 
-func TestGraft_NativeSourceKeepsDriverWithRootPathSyntax(t *testing.T) {
-	var calls atomic.Int32
-	sourceDriver := &graftTestSourceDriver{
-		testPathDriver: &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")},
-		calls:          &calls,
-	}
-
-	src, err := NewLazyTree(sourceDriver, "source", "SOURCE", NewDirective(".", appendProc("-s")), NewDirective(".leaf", appendProc("-l")))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dst := graftTestTree(t, "standard", "D", NewDirective("/parent", appendProc("-p")))
-
-	if err := dst.Graft("/parent/alias", src); err != nil {
-		t.Fatal(err)
-	}
-
-	if src.(*tree).driver != sourceDriver {
-		t.Fatal("Graft replaced source driver instead of retaining format execution")
-	}
-
-	graftTestGet(t, dst, "/parent/alias/leaf", "D-p-s-l")
-	if calls.Load() != 2 {
-		t.Fatalf("source realizer calls = %d; want 2", calls.Load())
-	}
-
-	if err := dst.Set(NewDirective("/parent/alias/added", appendProc("-a"))); err != nil {
-		t.Fatal(err)
-	}
-
-	graftTestGet(t, dst, "/parent/alias/added", "D-p-s-a")
-	if !dst.Has("/parent/alias/added") {
-		t.Fatal("Has switched from root parser to source parser")
-	}
-
-	if err := dst.Del("/parent/alias/added"); err != nil {
-		t.Fatal(err)
-	}
-
-	if dst.Has("/parent/alias/added") {
-		t.Fatal("Del switched from root parser to source parser")
-	}
-
-	other := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-other")))
-
-	if err := dst.Graft("/parent/alias/leaf/other", other); err != nil {
-		t.Fatal(err)
-	}
-
-	graftTestGet(t, dst, "/parent/alias/leaf/other", "D-p-s-l-other")
-	if other.Path() != "/parent/alias/leaf/other" {
-		t.Fatalf("Path did not use root syntax: %q", other.Path())
+			graftTestGet(t, root, "/a/b", "ROOT-keep")
+		})
 	}
 }
 
-func TestGraft_CustomRootParserControlsNativeTraversal(t *testing.T) {
-	rootDriver := &testPathDriver{Modem: driver.DummyModem, DelimiterPathParser: new(driver.DelimiterPathParser).WithDelimiter(".")}
-	root, err := NewLazyTree(rootDriver, "root", "R", NewDirective(".parent", appendProc("-p")))
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestGraft_OwnershipCheckPrecedesCycleCheck(t *testing.T) {
+	root := graftTestTree(t, "lazy", "ROOT", NewDirective("/branch/leaf"))
+	branch := root.pickChild("branch").(*tree)
+	leaf := branch.pickChild("leaf").(*tree)
 
-	source := graftTestTree(t, "lazy", "IGNORED", NewDirective("/", appendProc("-s")), NewDirective("/leaf", appendProc("-l")))
+	for _, tc := range []struct {
+		name     string
+		receiver *tree
+		source   *tree
+		want     string
+	}{
+		{"attached_self", branch, branch, "already attached"},
+		{"attached_ancestor", leaf, branch, "already attached"},
+		{"detached_self", root, root, "cycle"},
+		{"detached_ancestor", leaf, root, "cycle"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.receiver.Graft("/slot", tc.source)
 
-	if err := root.Graft(".parent.alias", source); err != nil {
-		t.Fatal(err)
-	}
-
-	graftTestGet(t, root, ".parent.alias.leaf", "R-p-s-l")
-	if source.Path() != ".parent.alias" || source.pickChild("leaf").Path() != ".parent.alias.leaf" {
-		t.Fatalf("mounted paths ignored root parser: %q/%q", source.Path(), source.pickChild("leaf").Path())
-	}
-
-	if err := root.Set(NewDirective(".parent.alias.added", appendProc("-a"))); err != nil {
-		t.Fatal(err)
-	}
-
-	graftTestGet(t, root, ".parent.alias.added", "R-p-s-a")
-	if !root.Has(".parent.alias.added") {
-		t.Fatal("custom root Has did not consume local segments")
-	}
-
-	if err := root.Del(".parent.alias.added"); err != nil {
-		t.Fatal(err)
-	}
-
-	if root.Has(".parent.alias.added") {
-		t.Fatal("custom root Del did not consume local segments")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Graft error = %v; want %q rejection", err, tc.want)
+			}
+		})
 	}
 }
 
-// This intentionally does not embed a native tree: every public operation is
-// overridden so a promoted Get/Set cannot conceal an incorrect full-path call.
-type graftTestForeignTree struct {
-	calls       map[string]string
-	setProcs    []driver.Processor
-	graftSource Tree
-	params      map[string]string
-}
-
-func newGraftTestForeignTree() *graftTestForeignTree {
-	return &graftTestForeignTree{calls: make(map[string]string)}
-}
-
-func (*graftTestForeignTree) Name() string { return "foreign-identity" }
-
-func (*graftTestForeignTree) Path() string { return "" }
-
-func (f *graftTestForeignTree) Get(path string) ([]byte, error) {
-	f.calls["Get"] = path
-
-	return []byte("foreign:" + path), nil
-}
-
-func (f *graftTestForeignTree) GetWithContext(rc *driver.RealizeContext, path string) ([]byte, error) {
-	f.calls["GetWithContext"] = path
-
-	if rc != nil {
-		f.params = rc.Params
-	}
-
-	return []byte("foreign-context:" + path), nil
-}
-
-func (f *graftTestForeignTree) Set(d Directive) error {
-	f.calls["Set"] = d.Path()
-	f.setProcs = d.Processors()
-
-	return nil
-}
-
-func (f *graftTestForeignTree) Has(path string) bool {
-	f.calls["Has"] = path
-
-	return true
-}
-
-func (f *graftTestForeignTree) Del(path string) error {
-	f.calls["Del"] = path
-
-	return nil
-}
-
-func (f *graftTestForeignTree) Graft(path string, source Tree) error {
-	f.calls["Graft"] = path
-	f.graftSource = source
-
-	return nil
-}
-
-func (*graftTestForeignTree) ShowStruct() []byte { return []byte(`{}`) }
-
-func (*graftTestForeignTree) SetRateLimit(rate.Limit, int) {}
-
-func (*graftTestForeignTree) SetFallback(driver.Processor) {}
-
-func (*graftTestForeignTree) SetDefaultContext(*driver.RealizeContext) {}
-
-func TestGraft_ForeignTreeReceivesOnlyRemainingLocalPaths(t *testing.T) {
-	dst := graftTestTree(t, "standard", "D", NewDirective("/parent"))
-	foreign := newGraftTestForeignTree()
-
-	if err := dst.Graft("/parent/alias", foreign); err != nil {
-		t.Fatal(err)
-	}
-
-	graftTestGet(t, dst, "/parent/alias/leaf/child", "foreign:/leaf/child")
-	got, err := dst.GetWithContext(paramRC(map[string]string{"user": "alice"}), "/parent/alias/leaf/child")
-	if err != nil || string(got) != "foreign-context:/leaf/child" || foreign.params["user"] != "alice" {
-		t.Fatalf("foreign context query = %q, %v, params=%v", got, err, foreign.params)
-	}
-
-	proc := appendProc("-set")
-
-	if err := dst.Set(NewDirective("/parent/alias/leaf/child", proc)); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(foreign.setProcs) != 1 || foreign.setProcs[0] != proc {
-		t.Fatal("local directive lost processors")
-	}
-
-	if !dst.Has("/parent/alias/leaf/child") {
-		t.Fatal("foreign Has result was lost")
-	}
-
-	if err := dst.Del("/parent/alias/leaf/child"); err != nil {
-		t.Fatal(err)
-	}
-
+func TestCycleCheck(t *testing.T) {
+	root := graftTestTree(t, "lazy", "ROOT", NewDirective("/child/leaf"))
+	child := root.pickChild("child").(*tree)
+	leaf := child.pickChild("leaf").(*tree)
 	other := graftTestTree(t, "lazy", "OTHER")
 
-	if err := dst.Graft("/parent/alias/leaf/child", other); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, method := range []string{"Get", "GetWithContext", "Set", "Has", "Del", "Graft"} {
-		if got := foreign.calls[method]; got != "/leaf/child" {
-			t.Errorf("foreign %s received %q; want local /leaf/child", method, got)
-		}
-	}
-
-	if foreign.graftSource != other {
-		t.Fatal("foreign Graft did not receive original source object")
+	for _, tc := range []struct {
+		name   string
+		source *tree
+		parent *tree
+		want   bool
+	}{
+		{"self", root, root, true},
+		{"direct_ancestor", root, child, true},
+		{"deep_ancestor", root, leaf, true},
+		{"descendant", leaf, root, false},
+		{"unrelated", other, leaf, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cycleCheck(tc.source, tc.parent); got != tc.want {
+				t.Fatalf("cycleCheck = %v; want %v", got, tc.want)
+			}
+		})
 	}
 }
