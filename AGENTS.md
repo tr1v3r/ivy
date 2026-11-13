@@ -6,6 +6,20 @@ This file provides guidance for AI coding agents (Claude Code, Cursor, Codex CLI
 
 This is a Go-based hierarchical content-construction engine (ivy) that supports JSON, YAML, XML, TOML, and custom data formats. The engine supports lazy evaluation, instant mode, cache TTL, and tree-based content organization.
 
+## Component Knowledge Base
+
+`knowledge/` holds the five-part knowledge base (FLOW / DECISIONS / HISTORY /
+TODO / SCENARIOS) for the engine core — the intent, constraints, failure
+history, and acceptance scenarios that the source alone cannot express. Read
+`knowledge/FLOW.md` (evaluation pipeline, four tree modes, the param-aware
+dynamic layer, CURL/forest exception paths) and `knowledge/DECISIONS.md`
+(notably D-009 dynamic-layer caching contract, D-011 concurrency invariants,
+D-005 fallback contract) before changing tree/forest/driver/processor
+semantics. Open questions live in `knowledge/TODO.md` (T-002R `Forest.Get`
+nil-interface API shape, T-006 stale sections in this file and
+ARCHITECTURE.md). After code changes, verify against `knowledge/SCENARIOS.md`
+and update only the affected parts.
+
 ## Architecture
 
 ### Core Components
